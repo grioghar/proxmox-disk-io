@@ -55,6 +55,35 @@ graph on each guest's own Summary), but a node's RRD has no disk fields at all
 Uninstalling stops the collector but deliberately leaves the recorded history
 in `/var/lib/pve-disk-io/`.
 
+## Seeing through a FUSE pool
+
+A container writing to a mergerfs pool never touches a block device itself: it
+makes a syscall, the mergerfs daemon on the host does the I/O, and so the block
+layer -- and every cgroup built on it -- credits the daemon. The panel would
+then truthfully report *"mergerfs is writing to sdh"* while hiding the only
+thing worth knowing, which is who asked it to.
+
+Ticking **Trace FUSE pool** attributes that work back to the container:
+
+| ct | process | read | write | disks |
+| --- | --- | --- | --- | --- |
+| 3111 | Plex Transcoder | 77.6 MB/s | 8.1 MB/s | sdf |
+| 3134 | qbittorrent-nox | 3.9 MB/s | 1.3 MB/s | sdc, sdg, sdh |
+
+It works by matching open file descriptors on the pool's **st_dev** rather than
+on a path prefix, because a container sees the pool at its own mountpoint
+(`/storage` in one, `/mnt/storage` in another). The underlying disk comes from
+mergerfs's own `user.mergerfs.basepath` xattr, resolved through the mount table.
+
+Two things to keep in mind:
+
+- These figures are **syscall level** (`rchar`/`wchar`), so they include what
+  the page cache absorbed and exclude readahead. They are deliberately kept out
+  of the Share column and are not summed with the block level rows.
+- It is **opt in** because finding which processes hold files open on the pool
+  costs ~500ms. That scan is cached for 30s -- a transcode or an unpack lasts
+  minutes -- so ordinary polls stay at ~50ms while tracing is on.
+
 ## How the numbers are produced
 
 The API returns raw monotonic counters plus a high-resolution timestamp; the
@@ -66,7 +95,8 @@ interval.
 | --- | --- |
 | `/proc/diskstats` | per-disk throughput, IOPS, utilisation, latency, queue |
 | `/sys/block/*`, `/run/udev/data/b*` | model, serial, size, bus, scheduler |
-| cgroup v2 `io.stat` | per-container I/O, per device |
+| cgroup v2 `io.stat` | per-container I/O, and per host systemd unit, per device |
+| `/proc/pid/io` + mergerfs xattrs | containers reaching disks through a FUSE pool |
 | QMP `query-blockstats` | per-VM I/O, per drive |
 
 Guest names and the VM drive-to-disk mapping are cached for 30s (and refreshed
@@ -83,6 +113,14 @@ Three details worth knowing:
   underneath. Summing all lines would double count, so only physical disks are
   counted. This was verified to be exact: for a sample container, the physical
   disk's byte count equalled the sum of its dm children.
+
+- **The host itself.** Work outside any guest -- mergerfs pooling media, a
+  backup job -- lives in no guest cgroup, so attributing only guests leaves I/O
+  showing on a disk with nothing accounting for it. systemd puts each unit in
+  its own cgroup and `system.slice` *does* enable the io controller (unlike
+  `qemu.slice`), so host work is attributed per device the same way containers
+  are, for about 7ms. Units are labelled by what they are rather than by their
+  unit name: `mnt-storage.mount` is shown as `/mnt/storage (mergerfs)`.
 
 - **VMs.** `qemu.slice` does not enable the io controller, so per-VM cgroup
   stats are empty. Numbers come from QMP instead, and each drive is mapped to

@@ -178,9 +178,30 @@ Ext.onReady(function () {
             return '<span class="pve-diskio-tag">' + Ext.htmlEncode(label) + '</span>';
         },
 
-        renderGuest: function (value, metaData, record) {
-            let icon = record.data.type === 'lxc' ? 'fa fa-cube' : 'fa fa-desktop';
+        renderConsumer: function (value, metaData, record) {
+            let icons = {
+                lxc: 'fa fa-cube',
+                qemu: 'fa fa-desktop',
+                host: 'fa fa-server',
+                fuse: 'fa fa-exchange',
+            };
+            let icon = icons[record.data.type] || 'fa fa-question-circle-o';
             return '<i class="' + icon + '"></i> ' + Ext.htmlEncode(value);
+        },
+
+        // Host units have no vmid; the store types the column as a number, so
+        // an absent one arrives here as 0 and must not read as a real guest id.
+        // FUSE rows do have one, but their figures come from a different layer,
+        // so they are tagged to keep that visible.
+        renderVmid: function (value, metaData, record) {
+            if (!value) {
+                let label = record.data.type === 'host' ? gettext('host') : '-';
+                return '<span class="pve-diskio-idle">' + label + '</span>';
+            }
+            if (record.data.type === 'fuse') {
+                return value + ' <span class="pve-diskio-tag">fuse</span>';
+            }
+            return value;
         },
     });
 
@@ -239,8 +260,12 @@ Ext.onReady(function () {
         interval: 3,
         paused: false,
 
-        // devno of the disk the guest grid is scoped to, or null for "all".
+        // devno of the disk the consumer grid is scoped to, or null for "all".
         selectedDisk: null,
+
+        // Host units that have done I/O since the panel opened, so they keep
+        // their row instead of flickering in and out.
+        activeHostUnits: null,
 
         initComponent: function () {
             let me = this;
@@ -250,6 +275,7 @@ Ext.onReady(function () {
                 throw 'no node name specified';
             }
             me.nodename = nodename;
+            me.activeHostUnits = {};
 
             me.diskStore = Ext.create('Ext.data.Store', {
                 fields: [
@@ -278,6 +304,7 @@ Ext.onReady(function () {
 
             me.guestStore = Ext.create('Ext.data.Store', {
                 fields: [
+                    'id',
                     'name',
                     'type',
                     'source',
@@ -292,7 +319,13 @@ Ext.onReady(function () {
                     { name: 'share', type: 'number' },
                     { name: 'partial', type: 'boolean' },
                 ],
-                sorters: [{ property: 'totalRate', direction: 'DESC' }],
+                // Most rows sit at zero, and ties do not order deterministically
+                // -- without the second key they reshuffle on every poll and the
+                // grid churns under the pointer.
+                sorters: [
+                    { property: 'totalRate', direction: 'DESC' },
+                    { property: 'id', direction: 'ASC' },
+                ],
             });
 
             me.chartStore = Ext.create('Ext.data.Store', {
@@ -403,6 +436,31 @@ Ext.onReady(function () {
                         },
                     },
                 },
+                '-',
+                {
+                    xtype: 'checkbox',
+                    boxLabel: gettext('Trace FUSE pool'),
+                    // Finding which processes hold files open on the pool costs
+                    // a few hundred ms, so it is not paid unless asked for.
+                    autoEl: {
+                        tag: 'div',
+                        'data-qtip': gettext(
+                            'Attribute I/O that reaches the disks through a FUSE pool such as'
+                                + ' mergerfs back to the container that asked for it. These rows'
+                                + ' are measured at the syscall level, so they are not directly'
+                                + ' comparable with the block level figures above.',
+                        ),
+                    },
+                    listeners: {
+                        change: function (field, value) {
+                            me.traceFuse = value;
+                            me.previous = null;
+                            if (!me.paused) {
+                                me.startPolling();
+                            }
+                        },
+                    },
+                },
                 '->',
                 {
                     xtype: 'tbtext',
@@ -432,7 +490,13 @@ Ext.onReady(function () {
                 store: me.diskStore,
                 title: gettext('Physical Disks'),
                 emptyText: gettext('Sampling...'),
-                viewConfig: { stripeRows: true, deferEmptyText: false },
+                // preserveScrollOnRefresh: the store is re-sorted on every poll,
+                // and a refresh otherwise takes the viewport back with it.
+                viewConfig: {
+                    stripeRows: true,
+                    deferEmptyText: false,
+                    preserveScrollOnRefresh: true,
+                },
                 columns: [
                     {
                         text: gettext('Device'),
@@ -563,21 +627,29 @@ Ext.onReady(function () {
                 flex: 1.3,
                 border: false,
                 store: me.guestStore,
-                title: gettext('Guests'),
+                title: gettext('Consumers'),
                 emptyText: gettext('Sampling...'),
-                viewConfig: { stripeRows: true, deferEmptyText: false },
+                // preserveScrollOnRefresh: the store is re-sorted on every poll,
+                // and a refresh otherwise takes the viewport back with it.
+                viewConfig: {
+                    stripeRows: true,
+                    deferEmptyText: false,
+                    preserveScrollOnRefresh: true,
+                },
                 columns: [
                     {
                         text: gettext('ID'),
                         dataIndex: 'vmid',
-                        width: 70,
+                        // Wide enough for a vmid plus the "fuse" tag.
+                        width: 100,
+                        renderer: U.renderVmid,
                     },
                     {
                         text: gettext('Name'),
                         dataIndex: 'name',
                         flex: 1,
-                        minWidth: 120,
-                        renderer: U.renderGuest,
+                        minWidth: 170,
+                        renderer: U.renderConsumer,
                     },
                     {
                         text: gettext('Read'),
@@ -654,7 +726,7 @@ Ext.onReady(function () {
             me.pollInFlight = true;
 
             Proxmox.Utils.API2Request({
-                url: '/nodes/' + me.nodename + '/disks/io',
+                url: '/nodes/' + me.nodename + '/disks/io' + (me.traceFuse ? '?fuse=1' : ''),
                 method: 'GET',
                 success: function (response) {
                     me.pollInFlight = false;
@@ -736,7 +808,7 @@ Ext.onReady(function () {
 
             let prevGuests = {};
             previous.guests.forEach((g) => {
-                prevGuests[g.type + ':' + g.vmid] = g;
+                prevGuests[g.id] = g;
             });
 
             // --- per guest, and per (guest, disk) ---------------------------
@@ -745,13 +817,14 @@ Ext.onReady(function () {
             let diskGuestRate = {}; // devno -> total attributed rate
 
             current.guests.forEach((guest) => {
-                let key = guest.type + ':' + guest.vmid;
-                let before = prevGuests[key];
+                let before = prevGuests[guest.id];
                 if (!before) {
                     return;
                 }
 
-                let label = guest.name + ' (' + guest.vmid + ')';
+                // Host units have no vmid, so the disk grid's "top consumer"
+                // label has to fall back to just the name.
+                let label = guest.vmid ? guest.name + ' (' + guest.vmid + ')' : guest.name;
 
                 // Per-disk contribution, used both for the guest grid when a
                 // disk is selected and for the disks grid's top consumer.
@@ -796,7 +869,22 @@ Ext.onReady(function () {
                     .map((devno) => (prevDisks[devno] || {}).dev || devno)
                     .sort();
 
+                // A guest belongs in the list whether or not it is busy -- it
+                // is a thing you expect to find. There are ~60 host units and
+                // most never touch a disk, so they earn their row by doing I/O
+                // once. They then keep it: adding and removing rows on every
+                // poll made the grid jump under the pointer.
+                if (guest.type === 'host') {
+                    if (readRate + writeRate > 0) {
+                        me.activeHostUnits[guest.id] = true;
+                    }
+                    if (!me.activeHostUnits[guest.id]) {
+                        return;
+                    }
+                }
+
                 guestRows.push({
+                    id: guest.id,
                     vmid: guest.vmid,
                     name: guest.name,
                     type: guest.type,
@@ -816,9 +904,57 @@ Ext.onReady(function () {
                 });
             });
 
-            let guestTotal = guestRows.reduce((sum, row) => sum + row.totalRate, 0);
+            // Work that reached the disks through a FUSE pool. The block layer
+            // credits the FUSE daemon, so without this the panel can only say
+            // "mergerfs is writing to sdh" and never who asked it to.
+            let prevFuse = {};
+            (previous.fuse || []).forEach((f) => {
+                prevFuse[f.id] = f;
+            });
+
+            (current.fuse || []).forEach((entry) => {
+                let before = prevFuse[entry.id];
+                if (!before) {
+                    return;
+                }
+
+                let readRate = U.rate(entry.rchar, before.rchar, dt);
+                let writeRate = U.rate(entry.wchar, before.wchar, dt);
+                if (readRate + writeRate <= 0) {
+                    return;
+                }
+
+                let disks = (entry.disks || []).map((devno) => (prevDisks[devno] || {}).dev || devno);
+                if (me.selectedDisk && disks.indexOf((prevDisks[me.selectedDisk] || {}).dev) === -1) {
+                    return;
+                }
+
+                guestRows.push({
+                    id: entry.id,
+                    vmid: entry.vmid,
+                    name: entry.comm,
+                    type: 'fuse',
+                    source: 'fuse',
+                    partial: false,
+                    readRate: readRate,
+                    writeRate: writeRate,
+                    totalRate: readRate + writeRate,
+                    readIops: 0,
+                    writeIops: 0,
+                    iops: 0,
+                    share: 0,
+                    disks: disks.sort().join(', '),
+                });
+            });
+
+            // Share is a proportion of block level I/O; the FUSE rows are
+            // syscall level and would distort it, so they are left out.
+            let guestTotal = guestRows
+                .filter((row) => row.type !== 'fuse')
+                .reduce((sum, row) => sum + row.totalRate, 0);
             guestRows.forEach((row) => {
-                row.share = guestTotal > 0 ? row.totalRate / guestTotal : 0;
+                row.share =
+                    row.type !== 'fuse' && guestTotal > 0 ? row.totalRate / guestTotal : 0;
             });
 
             // --- per disk ---------------------------------------------------
@@ -893,18 +1029,24 @@ Ext.onReady(function () {
                 };
             });
 
-            me.syncRecords(me.diskStore, diskRows, 'devno');
+            me.syncRecords(me.diskStore, diskRows, 'devno', me.disksGrid);
             me.refreshDiskFilter();
-            me.syncRecords(me.guestStore, guestRows, (r) => r.type + ':' + r.vmid);
+            me.syncRecords(me.guestStore, guestRows, 'id', me.guestsGrid);
 
             me.pushChartSample(current.time, totals.read, totals.write);
             me.refreshSummary(totals, busiest, guestRows);
         },
 
         // Update rows in place so the grid keeps its selection, scroll offset
-        // and sort while the numbers change underneath.
-        syncRecords: function (store, rows, keyOf) {
+        // and sort while the numbers change underneath. Adding or removing any
+        // row still moves the viewport, so the scroll position is restored
+        // explicitly afterwards.
+        syncRecords: function (store, rows, keyOf, grid) {
             let key = Ext.isFunction(keyOf) ? keyOf : (r) => r[keyOf];
+
+            let view = grid && grid.rendered ? grid.getView() : null;
+            let scroller = view && view.getScrollable ? view.getScrollable() : null;
+            let position = scroller ? scroller.getPosition() : null;
 
             let existing = {};
             store.each((record) => {
@@ -938,7 +1080,21 @@ Ext.onReady(function () {
             if (additions.length) {
                 store.add(additions);
             }
+
+            // Re-sorting refreshes the whole view, which drops the viewport
+            // back to the top -- every poll, not just when rows come and go.
             store.sort();
+
+            if (scroller && position && (position.x || position.y)) {
+                scroller.scrollTo(position.x, position.y);
+                // The refresh can settle a frame later and take the viewport
+                // with it, so put it back once more after that has happened.
+                Ext.defer(function () {
+                    if (!store.destroyed && scroller && !scroller.destroyed) {
+                        scroller.scrollTo(position.x, position.y);
+                    }
+                }, 1);
+            }
         },
 
         refreshDiskFilter: function () {
@@ -1032,23 +1188,22 @@ Ext.onReady(function () {
             if (me.selectedDisk) {
                 let record = me.diskStore.findRecord('devno', me.selectedDisk, 0, false, true, true);
                 let dev = record ? record.data.dev : me.selectedDisk;
-                text.setText(Ext.String.format(gettext('Guest I/O shown for {0}'), dev));
-                me.guestsGrid.setTitle(Ext.String.format(gettext('Guests on {0}'), dev));
+                text.setText(Ext.String.format(gettext('I/O shown for {0}'), dev));
+                me.guestsGrid.setTitle(Ext.String.format(gettext('Consumers on {0}'), dev));
                 clear.setHidden(false);
             } else {
                 text.setText('');
-                me.guestsGrid.setTitle(gettext('Guests'));
+                me.guestsGrid.setTitle(gettext('Consumers'));
                 clear.setHidden(true);
             }
         },
     });
 
-    // ------------------------------------------------ summary history chart
+    // ------------------------------------------------ summary history charts
 
-    // Distinguishable in both themes and stable across reloads: series colours
-    // are assigned by the disk's position in the (sorted) index, so a given
-    // disk keeps its colour.
-    const DISK_PALETTE = [
+    // Distinguishable in both themes, and assigned by rank position so a
+    // series keeps its colour between refreshes.
+    const SERIES_PALETTE = [
         '#115fa6',
         '#94ae0a',
         '#a61120',
@@ -1063,33 +1218,43 @@ Ext.onReady(function () {
         '#8c5a2b',
     ];
 
+    const OTHER_COLOR = '#9d9d9d';
+
     // The stock RRD store builds its URL as "<rrdurl>?timeframe=..&cf=..".
-    // Carrying which disk to plot means extending that, but everything else --
-    // including following the page's Hour/Day/Week/Month/Year selector -- is
-    // inherited unchanged.
-    Ext.define('PVE.data.DiskIORRDStore', {
+    // Carrying which disk or guest to plot means extending that; everything
+    // else -- including following the page's Hour/Day/Week/Month/Year
+    // selector -- is inherited unchanged.
+    Ext.define('PVE.data.IOHistoryRRDStore', {
         extend: 'Proxmox.data.RRDStore',
 
-        diskKey: 'all',
+        extraParams: undefined,
 
         setRRDUrl: function (timeframe, cf) {
             let me = this;
             me.callParent([timeframe, cf]);
-            me.proxy.url += '&disk=' + encodeURIComponent(me.diskKey);
+            Ext.Object.each(me.extraParams || {}, function (key, value) {
+                me.proxy.url += '&' + key + '=' + encodeURIComponent(value);
+            });
         },
     });
 
-    Ext.define('PVE.node.DiskIOSummaryChart', {
+    // Shared behaviour for the two Summary graphs: load a list of things that
+    // can be plotted, put a picker for them in the chart's own header, and
+    // rebuild the chart when the selection changes. Subclasses supply the URLs
+    // and decide what series to draw.
+    Ext.define('PVE.node.IOHistoryChart', {
         extend: 'Ext.panel.Panel',
-        alias: 'widget.pveNodeDiskIOSummaryChart',
 
         layout: 'fit',
         border: false,
         header: false,
 
-        // Which disk is plotted: 'all' overlays every disk, otherwise the key
-        // of a single disk from the rrdlist endpoint.
+        // Key of the entry being plotted, or 'all'.
         selected: 'all',
+
+        // Whether the plotted series depend on the timeframe. They do for
+        // guests, where the set drawn is whoever was busiest in that window.
+        rebuildOnTimeframe: false,
 
         initComponent: function () {
             let me = this;
@@ -1102,20 +1267,45 @@ Ext.onReady(function () {
 
             me.callParent();
 
-            me.loadDisks();
+            if (me.rebuildOnTimeframe) {
+                let sp = Ext.state.Manager.getProvider();
+                me.mon(sp, 'statechange', function (prov, key) {
+                    if (key !== 'proxmoxRRDTypeSelection') {
+                        return;
+                    }
+                    Ext.defer(function () {
+                        if (!me.isDestroyed) {
+                            me.loadList();
+                        }
+                    }, 1);
+                });
+            }
+
+            me.loadList();
         },
 
-        loadDisks: function () {
+        // The timeframe selector is shared page state rather than a property of
+        // any one chart, so read it from where the stores read it.
+        currentTimeframe: function () {
+            let state = Ext.state.Manager.getProvider().get('proxmoxRRDTypeSelection');
+            return {
+                timeframe: (state && state.timeframe) || 'hour',
+                cf: (state && state.cf) || 'AVERAGE',
+            };
+        },
+
+        loadList: function () {
             let me = this;
 
             Proxmox.Utils.API2Request({
-                url: '/nodes/' + me.nodename + '/disks/io/rrdlist',
+                url: me.getListUrl(),
                 method: 'GET',
                 success: function (response) {
                     if (me.isDestroyed) {
                         return;
                     }
-                    me.disks = response.result.data || [];
+                    Proxmox.Utils.setErrorMask(me, false);
+                    me.entries = response.result.data || [];
                     me.buildChart();
                 },
                 failure: function (response) {
@@ -1134,80 +1324,59 @@ Ext.onReady(function () {
             if (me.rrdstore) {
                 me.rrdstore.stopUpdate();
                 me.rrdstore.destroy();
+                me.rrdstore = undefined;
             }
 
-            let disks = me.disks || [];
-            let single = me.selected !== 'all' ? disks.find((d) => d.key === me.selected) : null;
+            let spec = me.seriesFor(me.entries || []);
 
-            // 'all' plots one series per disk (total throughput, so each disk
-            // is a single readable line); a specific disk splits into read and
-            // write, which is the interesting question once you have picked one.
-            let fields;
-            let fieldTitles;
-            let colors;
-            let seriesConfig;
-
-            if (single) {
-                fields = ['read', 'write'];
-                fieldTitles = [gettext('Read'), gettext('Write')];
-                colors = ['#115fa6', '#94ae0a'];
-            } else {
-                let usable = disks.filter((d) => d.dev);
-                fields = usable.map((d) => d.dev);
-                fieldTitles = usable.map((d) => d.dev + (d.present ? '' : ' (' + gettext('detached') + ')'));
-                colors = usable.map((d, i) => DISK_PALETTE[i % DISK_PALETTE.length]);
-
-                // RRDChart fills its series by default, which reads well for
-                // two series but turns nine overlaid disks into a muddy stack
-                // where no single disk can be followed. Plain lines instead.
-                seriesConfig = {
-                    fill: false,
-                    style: { lineWidth: 1.5, opacity: 1 },
-                };
-            }
-
-            if (!fields.length) {
+            if (!spec || !spec.fields.length) {
                 me.add({
                     xtype: 'component',
                     padding: 20,
-                    html: Ext.htmlEncode(
-                        gettext('No disk I/O history recorded yet.'),
-                    ),
+                    html: Ext.htmlEncode(me.emptyText || gettext('No history recorded yet.')),
                 });
                 return;
             }
 
-            me.rrdstore = Ext.create('PVE.data.DiskIORRDStore', {
-                rrdurl: '/api2/json/nodes/' + me.nodename + '/disks/io/rrddata',
-                diskKey: me.selected,
+            let params = {};
+            params[me.paramName] = me.selected;
+
+            me.rrdstore = Ext.create('PVE.data.IOHistoryRRDStore', {
+                rrdurl: me.getDataUrl(),
+                extraParams: params,
                 // Same time handling as PVE's own RRD models: the API returns
                 // epoch seconds and Ext converts them to a Date for the axis.
                 fields: [{ name: 'time', type: 'date', dateFormat: 'timestamp' }].concat(
-                    fields,
+                    spec.fields,
                 ),
             });
 
-            let title = single
-                ? Ext.String.format(gettext('Disk I/O - {0}'), single.dev || single.key)
-                : gettext('Disk I/O');
-
             let chart = Ext.create('Proxmox.widget.RRDChart', {
-                title: title,
+                title: spec.title,
                 store: me.rrdstore,
-                fields: fields,
-                fieldTitles: fieldTitles,
-                colors: colors,
+                fields: spec.fields,
+                fieldTitles: spec.fieldTitles,
+                colors: spec.colors,
                 unit: 'bytespersecond',
-                seriesConfig: seriesConfig,
+                seriesConfig: spec.seriesConfig,
                 border: false,
             });
 
-            // Put the disk picker in the chart's own header, beside the title
-            // and legend, so the whole thing reads as one window rather than a
+            // Put the picker in the chart's own header, beside the title and
+            // legend, so the whole thing reads as one window rather than a
             // chart with a toolbar bolted on top.
             let header = chart.getHeader();
             if (header) {
                 header.insert(1, me.buildPicker());
+
+                // The legend flexes to fill the header, and with one entry per
+                // guest it squeezes the title to zero width -- which loses the
+                // graph's name on a page where several graphs are stacked.
+                let title = header.down('title');
+                if (title && title.setMinWidth) {
+                    title.setMinWidth(150);
+                    title.setFlex(0);
+                }
             }
 
             me.add(chart);
@@ -1217,28 +1386,16 @@ Ext.onReady(function () {
         buildPicker: function () {
             let me = this;
 
-            let rows = [{ key: 'all', label: gettext('All disks') }];
-            for (const disk of me.disks || []) {
-                let label = disk.dev || disk.key;
-                if (disk.model) {
-                    label += ' - ' + disk.model;
-                }
-                if (!disk.present) {
-                    label += ' (' + gettext('detached') + ')';
-                }
-                rows.push({ key: disk.key, label: label });
-            }
-
             return {
                 xtype: 'combobox',
                 margin: '0 8 0 8',
-                width: 260,
+                width: me.pickerWidth || 260,
                 editable: false,
                 queryMode: 'local',
                 displayField: 'label',
                 valueField: 'key',
                 value: me.selected,
-                store: { fields: ['key', 'label'], data: rows },
+                store: { fields: ['key', 'label'], data: me.pickerRows(me.entries || []) },
                 listeners: {
                     change: function (field, value) {
                         if (value === me.selected) {
@@ -1271,10 +1428,151 @@ Ext.onReady(function () {
         },
     });
 
+    // --- physical disks ---
+
+    Ext.define('PVE.node.DiskIOSummaryChart', {
+        extend: 'PVE.node.IOHistoryChart',
+        alias: 'widget.pveNodeDiskIOSummaryChart',
+
+        paramName: 'disk',
+        emptyText: gettext('No disk I/O history recorded yet.'),
+
+        getListUrl: function () {
+            return '/nodes/' + this.nodename + '/disks/io/rrdlist';
+        },
+
+        getDataUrl: function () {
+            return '/api2/json/nodes/' + this.nodename + '/disks/io/rrddata';
+        },
+
+        pickerRows: function (entries) {
+            let rows = [{ key: 'all', label: gettext('All disks') }];
+            for (const disk of entries) {
+                let label = disk.dev || disk.key;
+                if (disk.model) {
+                    label += ' - ' + disk.model;
+                }
+                if (!disk.present) {
+                    label += ' (' + gettext('detached') + ')';
+                }
+                rows.push({ key: disk.key, label: label });
+            }
+            return rows;
+        },
+
+        seriesFor: function (entries) {
+            let me = this;
+            let single = me.selected !== 'all' ? entries.find((d) => d.key === me.selected) : null;
+
+            // A specific disk splits into read and write, which is the
+            // interesting question once you have picked one.
+            if (single) {
+                return {
+                    title: Ext.String.format(
+                        gettext('Disk I/O - {0}'),
+                        single.dev || single.key,
+                    ),
+                    fields: ['read', 'write'],
+                    fieldTitles: [gettext('Read'), gettext('Write')],
+                    colors: ['#115fa6', '#94ae0a'],
+                };
+            }
+
+            let usable = entries.filter((d) => d.dev);
+            return {
+                title: gettext('Disk I/O'),
+                fields: usable.map((d) => d.dev),
+                fieldTitles: usable.map(
+                    (d) => d.dev + (d.present ? '' : ' (' + gettext('detached') + ')'),
+                ),
+                colors: usable.map((d, i) => SERIES_PALETTE[i % SERIES_PALETTE.length]),
+                // RRDChart fills its series by default, which reads well for
+                // two series but turns nine overlaid disks into a muddy stack
+                // where no single one can be followed. Plain lines instead.
+                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
+            };
+        },
+    });
+
+    // --- guests ---
+
+    Ext.define('PVE.node.GuestIOSummaryChart', {
+        extend: 'PVE.node.IOHistoryChart',
+        alias: 'widget.pveNodeGuestIOSummaryChart',
+
+        paramName: 'guest',
+        pickerWidth: 280,
+        emptyText: gettext('No guest disk I/O recorded yet.'),
+
+        // Which guests are drawn depends on who was busiest in the window on
+        // screen, so switching timeframe has to re-rank, not just refetch.
+        rebuildOnTimeframe: true,
+
+        getListUrl: function () {
+            let tf = this.currentTimeframe();
+            return (
+                '/nodes/' +
+                this.nodename +
+                '/disks/io/guestlist?timeframe=' +
+                tf.timeframe +
+                '&cf=' +
+                tf.cf
+            );
+        },
+
+        getDataUrl: function () {
+            return '/api2/json/nodes/' + this.nodename + '/disks/io/guestrrddata';
+        },
+
+        pickerRows: function (entries) {
+            let rows = [{ key: 'all', label: gettext('Busiest guests') }];
+            let seen = {};
+            for (const guest of entries) {
+                if (guest.type === 'other' || !guest.vmid || seen[guest.vmid]) {
+                    continue;
+                }
+                seen[guest.vmid] = true;
+                rows.push({ key: String(guest.vmid), label: guest.name + ' (' + guest.vmid + ')' });
+            }
+            return rows;
+        },
+
+        seriesFor: function (entries) {
+            let me = this;
+
+            if (me.selected !== 'all') {
+                let guest = entries.find((g) => String(g.vmid) === me.selected);
+                let label = guest ? guest.name + ' (' + guest.vmid + ')' : me.selected;
+                return {
+                    title: Ext.String.format(gettext('Guest Disk I/O - {0}'), label),
+                    fields: ['read', 'write'],
+                    fieldTitles: [gettext('Read'), gettext('Write')],
+                    colors: ['#115fa6', '#94ae0a'],
+                };
+            }
+
+            // The ranked head of the list is what the data endpoint returns as
+            // fields; entries after it are the full node roster for the picker.
+            let ranked = entries.filter((g) => !g.selectable);
+            return {
+                title: gettext('Disk I/O by Guest'),
+                fields: ranked.map((g) => g.field),
+                fieldTitles: ranked.map((g) =>
+                    g.type === 'other'
+                        ? Ext.String.format(gettext('Other ({0})'), g.count)
+                        : g.field,
+                ),
+                colors: ranked.map((g, i) =>
+                    g.type === 'other' ? OTHER_COLOR : SERIES_PALETTE[i % SERIES_PALETTE.length],
+                ),
+                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
+            };
+        },
+    });
+
     // The node Summary builds its graphs into a single column container. Adding
-    // to that after it exists puts the disk I/O history alongside the CPU,
-    // memory and network graphs, picking up the same column width, height and
-    // padding defaults.
+    // to that after it exists puts these alongside the CPU, memory and network
+    // graphs, picking up the same column width, height and padding defaults.
     Ext.define('PVE.node.DiskIOSummaryInjection', {
         override: 'PVE.node.Summary',
 
@@ -1285,15 +1583,20 @@ Ext.onReady(function () {
 
             try {
                 let container = me.down('#itemcontainer');
-                if (container && !container.down('pveNodeDiskIOSummaryChart')) {
-                    container.add({
-                        xtype: 'pveNodeDiskIOSummaryChart',
-                        nodename: me.pveSelNode.data.node,
-                    });
+                if (!container) {
+                    return;
+                }
+                let nodename = me.pveSelNode.data.node;
+
+                if (!container.down('pveNodeDiskIOSummaryChart')) {
+                    container.add({ xtype: 'pveNodeDiskIOSummaryChart', nodename: nodename });
+                }
+                if (!container.down('pveNodeGuestIOSummaryChart')) {
+                    container.add({ xtype: 'pveNodeGuestIOSummaryChart', nodename: nodename });
                 }
             } catch (err) {
                 if (window.console && window.console.error) {
-                    window.console.error('pve-disk-io: could not add summary chart', err);
+                    window.console.error('pve-disk-io: could not add summary charts', err);
                 }
             }
         },

@@ -68,10 +68,20 @@ install -m 0644 "$SRC_DIR/js/pve-disk-io.js" "$PANEL_JS"
 
 echo "==> adding the script tag"
 [ -f "$BACKUP_DIR/index.html.tpl.orig" ] || cp -a "$INDEX_TPL" "$BACKUP_DIR/index.html.tpl.orig"
-perl -0777 -i -pe '
-    if (!/pve-disk-io\.js/) {
-        s{(^\s*<script type="text/javascript" src="/pve2/js/pvemanagerlib\.js\?ver=\[% version %\]"></script>\n)}
-         {$1    <script type="text/javascript" src="/pve2/js/pve-disk-io.js?ver=[% version %]"></script>\n}m;
+
+# Cache-bust on the panel's own content, not on [% version %]. That template
+# variable is the pve-manager version, which does not change when this file is
+# redeployed -- so browsers kept serving the previously cached panel and a
+# reinstall appeared to do nothing until someone hard-reloaded.
+PANEL_VER="$(md5sum "$SRC_DIR/js/pve-disk-io.js" | cut -c1-12)"
+
+PANEL_VER="$PANEL_VER" perl -0777 -i -pe '
+    my $tag = qq{    <script type="text/javascript" src="/pve2/js/pve-disk-io.js?ver=$ENV{PANEL_VER}"></script>\n};
+    # Replace any tag we added before, so repeated installs do not stack up.
+    if (s{^[^\n]*pve-disk-io\.js[^\n]*\n}{$tag}m) {
+        # updated in place
+    } else {
+        s{(^\s*<script type="text/javascript" src="/pve2/js/pvemanagerlib\.js\?ver=\[% version %\]"></script>\n)}{$1$tag}m;
     }
 ' "$INDEX_TPL"
 

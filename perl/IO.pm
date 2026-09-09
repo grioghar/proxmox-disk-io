@@ -228,6 +228,7 @@ sub _lxc_guests {
         }
 
         push @$guests, {
+            id => "lxc:$vmid",
             vmid => $vmid + 0,
             name => $names->{$vmid} // "CT $vmid",
             type => 'lxc',
@@ -238,6 +239,319 @@ sub _lxc_guests {
     }
 
     return $guests;
+}
+
+# Work on the host itself -- mergerfs pooling media, a backup job, nfsd
+# serving a share -- lives in no guest cgroup, so attributing only guests
+# leaves that I/O showing on a disk with nothing accounting for it. systemd
+# puts each unit in its own cgroup and system.slice does enable the io
+# controller (unlike qemu.slice), so host work can be attributed per device
+# exactly the way containers are, for about 7ms.
+sub _host_consumers {
+    my ($physical) = @_;
+
+    my $consumers = [];
+
+    my @cgroups = (
+        glob('/sys/fs/cgroup/system.slice/*/io.stat'),
+        glob('/sys/fs/cgroup/user.slice/*/io.stat'),
+        '/sys/fs/cgroup/init.scope/io.stat',
+    );
+
+    for my $path (@cgroups) {
+        next if !-f $path;
+
+        my $per_device = _cgroup_io_stat($path);
+        next if !defined($per_device);
+
+        my $dir = $path;
+        $dir =~ s{/io\.stat$}{};
+        my $unit = $dir;
+        $unit =~ s{.*/}{};
+
+        my $devices = {};
+        my $total = { rbytes => 0, wbytes => 0, rios => 0, wios => 0, dbytes => 0, dios => 0 };
+
+        for my $devno (keys %$per_device) {
+            next if !$physical->{$devno};
+            my $entry = $per_device->{$devno};
+            $devices->{$devno} = $entry;
+            $total->{$_} += $entry->{$_} for keys %$total;
+        }
+
+        next if !$total->{rbytes} && !$total->{wbytes};
+
+        push @$consumers, {
+            id => "host:$unit",
+            name => _unit_label($unit, $dir),
+            unit => $unit,
+            type => 'host',
+            source => 'cgroup',
+            devices => $devices,
+            %$total,
+        };
+    }
+
+    return $consumers;
+}
+
+# "mnt-storage.mount" is how systemd spells /mnt/storage, which is not what
+# anyone wants to read in a table. Naming the process inside it as well turns
+# a cryptic unit into the answer to "what is writing to this disk".
+sub _unit_label {
+    my ($unit, $dir) = @_;
+
+    my $label = $unit;
+
+    if ($unit =~ /^(.*)\.mount$/) {
+        my $escaped = $1;
+        # systemd escapes '/' as '-', so that substitution has to happen
+        # before \xNN unescaping or a literal '-' (stored as \x2d) breaks.
+        $escaped =~ s{-}{/}g;
+        $escaped =~ s{\\x([0-9a-fA-F]{2})}{chr(hex($1))}ge;
+        $label = "/$escaped";
+    } else {
+        $label =~ s/\.(?:service|scope|slice|socket|timer)$//;
+    }
+
+    if (defined(my $comm = _cgroup_first_comm($dir))) {
+        $label .= " ($comm)";
+    }
+
+    return $label;
+}
+
+# Two extra reads per host cgroup measured ~30ms across the node, doubling the
+# endpoint's cost for a string that changes only when a unit restarts.
+my $UNIT_COMM_TTL = 60;
+my $unit_comm_cache = { updated => 0, names => {} };
+
+sub _cgroup_first_comm {
+    my ($dir) = @_;
+
+    if ((time() - $unit_comm_cache->{updated}) >= $UNIT_COMM_TTL) {
+        $unit_comm_cache = { updated => time(), names => {} };
+    }
+    return $unit_comm_cache->{names}->{$dir} if exists $unit_comm_cache->{names}->{$dir};
+
+    my $comm;
+    if (my $procs = PVE::DiskIO::slurp("$dir/cgroup.procs")) {
+        if (my ($pid) = $procs =~ /^(\d+)/) {
+            my $name = PVE::DiskIO::slurp_trim("/proc/$pid/comm");
+            $comm = $name if defined($name) && $name ne '';
+        }
+    }
+
+    $unit_comm_cache->{names}->{$dir} = $comm;
+    return $comm;
+}
+
+# --- work reaching the disks through a FUSE pool -------------------------
+
+# A container writing to a mergerfs (or any FUSE) pool does not touch a block
+# device itself: it makes a syscall, the FUSE daemon on the host does the
+# actual I/O, and so the block layer -- and every cgroup built on it -- credits
+# the daemon. The panel would then truthfully report "mergerfs is writing to
+# sdh" while hiding the only thing worth knowing, which is who asked it to.
+#
+# These figures are syscall level (rchar/wchar), not block level: they include
+# what the page cache absorbed and exclude readahead, so they are deliberately
+# kept in their own view rather than summed with the block numbers elsewhere.
+
+my $FUSE_HOLDER_TTL = 30;
+my $fuse_holder_cache = { updated => 0, holders => undef };
+
+# FUSE filesystems worth tracing: a storage pool, not PVE's own config
+# filesystem or lxcfs.
+sub _fuse_pools {
+    my $pools = {};
+
+    my $data = PVE::DiskIO::slurp('/proc/self/mountinfo') // '';
+    for my $line (split(/\n/, $data)) {
+        my @f = split(/\s+/, $line);
+        next if scalar(@f) < 10;
+
+        my ($mountpoint) = ($f[4]);
+        my $sep = 0;
+        $sep++ while $sep < @f && $f[$sep] ne '-';
+        my $fstype = $f[$sep + 1] // '';
+
+        next if $fstype !~ /^fuse(?:\.(.+))?$/;
+        my $flavour = $1 // 'fuse';
+        next if $flavour eq 'lxcfs';
+        next if $mountpoint eq '/etc/pve';
+
+        my $dev = (stat($mountpoint))[0];
+        next if !defined($dev);
+
+        $pools->{$dev} = { mount => $mountpoint, flavour => $flavour };
+    }
+
+    return $pools;
+}
+
+# Which physical disk each of a pool's branches lives on, so a file's branch
+# can be turned into the disk actually carrying it.
+sub _branch_disks {
+    my ($physical, $cache) = @_;
+
+    my $branches = {};
+    my $data = PVE::DiskIO::slurp('/proc/self/mountinfo') // '';
+
+    for my $line (split(/\n/, $data)) {
+        my @f = split(/\s+/, $line);
+        next if scalar(@f) < 10;
+        my ($devno, $mountpoint) = ($f[2], $f[4]);
+        next if $devno !~ /^\d+:\d+$/;
+
+        my @disks = _resolve_physical($devno, $physical, $cache);
+        next if !scalar(@disks);
+        $branches->{$mountpoint} = \@disks;
+    }
+
+    return $branches;
+}
+
+# Which container a process belongs to, read straight from its cgroup line.
+# Walking the cgroup tree to enumerate container pids instead measured ~960ms,
+# because every entry needs a stat to tell a directory from a control file.
+sub _pid_container {
+    my ($pid) = @_;
+
+    my $cgroup = PVE::DiskIO::slurp("/proc/$pid/cgroup") // return undef;
+    return $1 if $cgroup =~ m{/lxc/(\d+)};
+    return undef;
+}
+
+# Finding who holds files open on a pool is the expensive part, but a
+# transcode or an unpack lasts minutes, so the set is cached and only the cheap
+# per-process counters are re-read on each poll.
+sub _fuse_holders {
+    my ($physical, $cache) = @_;
+
+    return $fuse_holder_cache->{holders}
+        if defined($fuse_holder_cache->{holders})
+        && (time() - $fuse_holder_cache->{updated}) < $FUSE_HOLDER_TTL;
+
+    my $pools = _fuse_pools();
+    if (!scalar(keys %$pools)) {
+        $fuse_holder_cache = { updated => time(), holders => [] };
+        return [];
+    }
+
+    my $branches = _branch_disks($physical, $cache);
+    my $holders = [];
+
+    for my $pid (PVE::DiskIO::listdir('/proc')) {
+        next if $pid !~ /^\d+$/;
+
+        my @matches;
+        for my $fd (PVE::DiskIO::listdir("/proc/$pid/fd")) {
+            my $path = "/proc/$pid/fd/$fd";
+
+            # Most descriptors are sockets and pipes. readlink is cheaper than
+            # stat and rules those out without touching the filesystem.
+            my $target = readlink($path);
+            next if !defined($target) || $target !~ m{^/};
+            next if $target =~ m{^/(?:proc|sys|dev)/};
+
+            # A container sees the pool at its own mountpoint, so match on the
+            # filesystem itself rather than on any path prefix.
+            my $dev = (stat($path))[0];
+            next if !defined($dev) || !$pools->{$dev};
+
+            push @matches, $path;
+            last if scalar(@matches) >= 16;
+        }
+
+        next if !scalar(@matches);
+
+        # Only now is it worth asking who owns this process.
+        my $vmid = _pid_container($pid) or next;
+
+        push @$holders, {
+            pid => $pid + 0,
+            vmid => $vmid + 0,
+            comm => PVE::DiskIO::slurp_trim("/proc/$pid/comm") // 'unknown',
+            paths => \@matches,
+            disks => [],
+        };
+    }
+
+    _attach_branch_disks($holders, $branches, $physical);
+
+    $fuse_holder_cache = { updated => time(), holders => $holders };
+    return $holders;
+}
+
+# mergerfs reports the branch a file actually lives on via an xattr. One
+# getfattr call covers every open file at once rather than forking per file.
+sub _attach_branch_disks {
+    my ($holders, $branches, $physical) = @_;
+
+    return if !scalar(@$holders);
+
+    my $paths = [map { @{ $_->{paths} } } @$holders];
+    return if !scalar(@$paths);
+
+    my $basepath = {};
+    my $current;
+
+    # getfattr prints "# file: <path>" then "name=value" per file, which is the
+    # shape that lets a single call cover every open file at once.
+    eval {
+        PVE::Tools::run_command(
+            ['getfattr', '--absolute-names', '-n', 'user.mergerfs.basepath', @$paths],
+            outfunc => sub {
+                my ($line) = @_;
+                if ($line =~ /^#\s*file:\s*(.+)$/) {
+                    $current = $1;
+                } elsif ($current && $line =~ /^user\.mergerfs\.basepath="?([^"]*)"?$/) {
+                    $basepath->{$current} = $1;
+                    $current = undef;
+                }
+            },
+            errfunc => sub { },
+            noerr => 1,
+        );
+    };
+
+    for my $holder (@$holders) {
+        my %disks;
+        for my $path (@{ $holder->{paths} }) {
+            my $branch = $basepath->{$path} or next;
+            my $devnos = $branches->{$branch} or next;
+            $disks{$_} = 1 for @$devnos;
+        }
+        $holder->{disks} = [sort keys %disks];
+        delete $holder->{paths};
+    }
+}
+
+sub _fuse_consumers {
+    my ($physical, $cache) = @_;
+
+    my $holders = _fuse_holders($physical, $cache);
+    my $consumers = [];
+
+    for my $holder (@$holders) {
+        my $io = PVE::DiskIO::slurp("/proc/$holder->{pid}/io") or next;
+        my ($rchar) = $io =~ /^rchar:\s+(\d+)/m;
+        my ($wchar) = $io =~ /^wchar:\s+(\d+)/m;
+        next if !defined($rchar) && !defined($wchar);
+
+        push @$consumers, {
+            id => "fuse:$holder->{pid}",
+            pid => $holder->{pid},
+            vmid => $holder->{vmid},
+            comm => $holder->{comm},
+            disks => $holder->{disks},
+            rchar => ($rchar // 0) + 0,
+            wchar => ($wchar // 0) + 0,
+        };
+    }
+
+    return $consumers;
 }
 
 sub _qemu_drive_volids {
@@ -325,6 +639,7 @@ sub _qemu_guests {
         }
 
         push @$guests, {
+            id => "qemu:$vmid",
             vmid => $vmid + 0,
             name => $info->{name},
             type => 'qemu',
@@ -390,6 +705,386 @@ sub _fetch_rrd {
 
     return $series;
 }
+
+# --- guest history --------------------------------------------------------
+
+# PVE already records diskread/diskwrite per guest, with the same retention as
+# every other guest metric -- that is what the Disk IO graph on a guest's own
+# Summary draws. What is missing is a node level view of it, so this reads
+# those existing RRDs rather than collecting anything new. Consequence worth
+# knowing: it inherits their granularity, which has no per-physical-disk
+# dimension. "Which guest" is answerable from history; "which guest on which
+# disk" is only answerable live, from the I/O Activity panel.
+
+# How long a computed window stays usable. Scaled to each timeframe's own
+# resolution rather than a flat number: the week view consolidates at 30
+# minutes and the year view at 6 hours, so re-reading 50 RRDs every 45s to
+# redraw an identical line is pure waste. The day view is the expensive one
+# (1440 points x ~50 guests, measured ~1.9s) and 5 minutes of staleness at the
+# right hand edge of a 24 hour graph is not visible.
+my $GUEST_HISTORY_TTL = {
+    hour => 60,
+    day => 300,
+    week => 600,
+    month => 900,
+    year => 1800,
+};
+
+my $guest_history_cache = {};
+
+my $GUEST_LIST_TTL = 120;
+my $guest_list_cache = { updated => 0, list => undef };
+
+sub _node_guest_list {
+    my ($node) = @_;
+
+    # 51 config reads off pmxcfs measured ~1s, which dwarfed everything else
+    # this endpoint does. Names and the guest roster change rarely.
+    if ($guest_list_cache->{list} && (time() - $guest_list_cache->{updated}) < $GUEST_LIST_TTL) {
+        return $guest_list_cache->{list};
+    }
+
+    # /etc/pve/lxc and /etc/pve/qemu-server are pmxcfs's view of *this* node's
+    # guests, and the endpoint is proxyto => 'node', so it always runs where
+    # they are correct. Reading them directly avoids PVE::Cluster::get_vmlist,
+    # which needs a cfs_update() first and silently returns nothing without it.
+    my $guests = [];
+
+    for my $conf (glob('/etc/pve/lxc/*.conf')) {
+        next if $conf !~ m{/(\d+)\.conf$};
+        my $vmid = $1;
+        my $name = eval { require PVE::LXC::Config; PVE::LXC::Config->load_config($vmid)->{hostname} };
+        push @$guests, { vmid => $vmid + 0, type => 'lxc', name => $name // "$vmid" };
+    }
+
+    for my $conf (glob('/etc/pve/qemu-server/*.conf')) {
+        next if $conf !~ m{/(\d+)\.conf$};
+        my $vmid = $1;
+        my $conf_data = eval { require PVE::QemuConfig; PVE::QemuConfig->load_config($vmid) };
+        # Templates never run, so they have no history worth plotting.
+        next if $conf_data && $conf_data->{template};
+        push @$guests, { vmid => $vmid + 0, type => 'qemu', name => $conf_data->{name} // "$vmid" };
+    }
+
+    my $sorted = [sort { $a->{vmid} <=> $b->{vmid} } @$guests];
+    $guest_list_cache = { updated => time(), list => $sorted };
+
+    return $sorted;
+}
+
+# PVE's own reader builds a hash of all ~17 data sources for every row. Across
+# 50 guests at day resolution that is 70k hashes and measured ~2.1s; only two
+# columns are wanted here, so read them directly. Resolutions match
+# PVE::RRD::create_rrd_data exactly so this graph lines up with the guest's own.
+my $GUEST_RRD_SETUP = {
+    hour => [60, 60],
+    day => [60, 1440],
+    week => [1800, 336],
+    month => [1800, 1440],
+    year => [21600, 1440],
+};
+
+sub _guest_disk_series {
+    my ($vmid, $timeframe, $cf) = @_;
+
+    my $spec = $GUEST_RRD_SETUP->{$timeframe} or return undef;
+    my ($resolution, $count) = @$spec;
+
+    my $file = "/var/lib/rrdcached/db/pve-vm-9.0/$vmid";
+    return undef if !-f $file;
+
+    # A node upgraded from PVE 8 can still hold part of the window in the old
+    # pve2 files. Stitching those together is fiddly, and PVE already does it,
+    # so hand those cases back to PVE's reader rather than quietly losing data.
+    if (-e "/var/lib/rrdcached/db/pve2-vm/$vmid" || -e "/var/lib/rrdcached/db/pve2-vm/$vmid.old") {
+        require PVE::RRD;
+        my $rows = eval { PVE::RRD::create_rrd_data("pve-vm-9.0/$vmid", $timeframe, $cf) } or return undef;
+
+        my $points = {};
+        my $total = 0;
+        for my $row (@$rows) {
+            my $t = $row->{time} or next;
+            next if !defined($row->{diskread}) && !defined($row->{diskwrite});
+            my $sum = ($row->{diskread} // 0) + ($row->{diskwrite} // 0);
+            $points->{ $t + 0 } = { read => $row->{diskread}, write => $row->{diskwrite}, total => $sum };
+            $total += $sum;
+        }
+        return { points => $points, total => $total };
+    }
+
+    my $ctime = $resolution * int(time() / $resolution);
+    my @args = (
+        '-s' => $ctime - $resolution * $count,
+        '-e' => $ctime - 1,
+        '-r' => $resolution,
+    );
+
+    # Same as PVE: go through rrdcached so the newest samples are flushed.
+    my $socket = '/var/run/rrdcached.sock';
+    push @args, '--daemon' => "unix:$socket" if -S $socket;
+
+    require RRDs;
+    my ($start, $step, $names, $data) = RRDs::fetch($file, $cf, @args);
+    return undef if RRDs::error() || !$data || !$names;
+
+    my ($read_idx, $write_idx);
+    for my $i (0 .. $#$names) {
+        $read_idx = $i if $names->[$i] eq 'diskread';
+        $write_idx = $i if $names->[$i] eq 'diskwrite';
+    }
+    return undef if !defined($read_idx) && !defined($write_idx);
+
+    my $points = {};
+    my $total = 0;
+    my $t = $start;
+
+    for my $row (@$data) {
+        my $read = defined($read_idx) ? $row->[$read_idx] : undef;
+        my $write = defined($write_idx) ? $row->[$write_idx] : undef;
+
+        if (defined($read) || defined($write)) {
+            my $sum = ($read // 0) + ($write // 0);
+            $points->{$t} = { read => $read, write => $write, total => $sum };
+            $total += $sum;
+        }
+        $t += $step;
+    }
+
+    return { points => $points, total => $total };
+}
+
+# Field names double as the chart's series titles, so they are the label the
+# user should read rather than an opaque id.
+sub _guest_field {
+    my ($guest) = @_;
+    return "$guest->{name} ($guest->{vmid})";
+}
+
+# Reading ~50 RRDs is too expensive to repeat for every poll of a store that
+# refreshes every 30s, and the underlying data only moves once a minute.
+sub _guest_history {
+    my ($node, $timeframe, $cf) = @_;
+
+    my $key = join('/', $node, $timeframe, $cf);
+    my $ttl = $GUEST_HISTORY_TTL->{$timeframe} // 60;
+    my $cached = $guest_history_cache->{$key};
+    return $cached->{data} if $cached && (time() - $cached->{updated}) < $ttl;
+
+    my $guests = _node_guest_list($node);
+    my $series = {};
+    my $totals = {};
+
+    for my $guest (@$guests) {
+        my $vmid = $guest->{vmid};
+        my $data = eval { _guest_disk_series($vmid, $timeframe, $cf) };
+        next if !$data || !scalar(keys %{ $data->{points} });
+
+        $series->{$vmid} = $data->{points};
+        $totals->{$vmid} = $data->{total};
+    }
+
+    my $result = { guests => $guests, series => $series, totals => $totals };
+    $guest_history_cache->{$key} = { updated => time(), data => $result };
+
+    return $result;
+}
+
+# Rank by how much I/O each guest did across the window being displayed, so
+# the graph names whoever actually mattered for that period.
+sub _ranked_guests {
+    my ($history, $top) = @_;
+
+    my $totals = $history->{totals};
+    my $byVmid = { map { $_->{vmid} => $_ } @{ $history->{guests} } };
+
+    my @ranked =
+        sort { ($totals->{$b} // 0) <=> ($totals->{$a} // 0) || $a <=> $b }
+        grep { ($totals->{$_} // 0) > 0 }
+        keys %$totals;
+
+    my @head = splice(@ranked, 0, $top);
+
+    return {
+        top => [map { $byVmid->{$_} } @head],
+        rest => [map { $byVmid->{$_} } @ranked],
+    };
+}
+
+__PACKAGE__->register_method({
+    name => 'guestlist',
+    path => 'guestlist',
+    method => 'GET',
+    proxyto => 'node',
+    protected => 1,
+    description => "Guests on this node ranked by how much disk I/O they did"
+        . " over the given timeframe. The chart uses this to decide which"
+        . " series to draw, so the ranking is per window: whoever mattered"
+        . " overnight is not necessarily whoever matters this hour.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            timeframe => {
+                type => 'string',
+                enum => ['hour', 'day', 'week', 'month', 'year'],
+            },
+            cf => {
+                type => 'string',
+                enum => ['AVERAGE', 'MAX'],
+                optional => 1,
+            },
+            top => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 16,
+                optional => 1,
+                default => 8,
+                description => "How many guests to name individually; the rest"
+                    . " are summed into a single 'Other' series.",
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $cf = $param->{cf} // 'AVERAGE';
+        my $history = _guest_history($param->{node}, $param->{timeframe}, $cf);
+        my $ranked = _ranked_guests($history, $param->{top} // 8);
+
+        my $out = [];
+        for my $guest (@{ $ranked->{top} }) {
+            push @$out, {
+                vmid => $guest->{vmid},
+                name => $guest->{name},
+                type => $guest->{type},
+                field => _guest_field($guest),
+                total => $history->{totals}->{ $guest->{vmid} } // 0,
+            };
+        }
+
+        if (scalar(@{ $ranked->{rest} })) {
+            # No vmid: 0 is not a guest id, and emitting one invites callers
+            # to render it as though it were.
+            push @$out, {
+                name => 'Other',
+                type => 'other',
+                field => 'Other',
+                count => scalar(@{ $ranked->{rest} }),
+            };
+        }
+
+        # Everything on the node, so the picker can offer a guest that is not
+        # currently in the top N (or is idle right now).
+        return [
+            @$out,
+            map {
+                {
+                    vmid => $_->{vmid},
+                    name => $_->{name},
+                    type => $_->{type},
+                    field => _guest_field($_),
+                    selectable => 1,
+                }
+            } @{ $history->{guests} },
+        ];
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'guestrrddata',
+    path => 'guestrrddata',
+    method => 'GET',
+    proxyto => 'node',
+    protected => 1,
+    description => "Per-guest disk I/O history for the node, read from the"
+        . " per-guest RRDs PVE already maintains. With guest=all each row"
+        . " carries one field per top guest plus 'Other'; with a vmid each row"
+        . " carries that guest's read and write.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            timeframe => {
+                type => 'string',
+                enum => ['hour', 'day', 'week', 'month', 'year'],
+            },
+            cf => {
+                type => 'string',
+                enum => ['AVERAGE', 'MAX'],
+                optional => 1,
+            },
+            guest => {
+                type => 'string',
+                optional => 1,
+                pattern => '^(?:all|\d+)$',
+                description => "A vmid, or 'all' (the default) to overlay the"
+                    . " busiest guests.",
+            },
+            top => {
+                type => 'integer',
+                minimum => 1,
+                maximum => 16,
+                optional => 1,
+                default => 8,
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $cf = $param->{cf} // 'AVERAGE';
+        my $which = $param->{guest} // 'all';
+        my $history = _guest_history($param->{node}, $param->{timeframe}, $cf);
+
+        my $rows = {};
+
+        if ($which ne 'all') {
+            my $points = $history->{series}->{ $which + 0 } or return [];
+            for my $t (keys %$points) {
+                $rows->{$t} = {
+                    time => $t + 0,
+                    read => $points->{$t}->{read},
+                    write => $points->{$t}->{write},
+                };
+            }
+        } else {
+            my $ranked = _ranked_guests($history, $param->{top} // 8);
+
+            for my $guest (@{ $ranked->{top} }) {
+                my $field = _guest_field($guest);
+                my $points = $history->{series}->{ $guest->{vmid} } or next;
+                for my $t (keys %$points) {
+                    my $row = $rows->{$t} //= { time => $t + 0 };
+                    $row->{$field} = $points->{$t}->{total};
+                }
+            }
+
+            for my $guest (@{ $ranked->{rest} }) {
+                my $points = $history->{series}->{ $guest->{vmid} } or next;
+                for my $t (keys %$points) {
+                    my $row = $rows->{$t} //= { time => $t + 0 };
+                    $row->{Other} = ($row->{Other} // 0) + $points->{$t}->{total};
+                }
+            }
+        }
+
+        return [map { $rows->{$_} } sort { $a <=> $b } keys %$rows];
+    },
+});
 
 __PACKAGE__->register_method({
     name => 'rrdlist',
@@ -564,6 +1259,14 @@ __PACKAGE__->register_method({
         additionalProperties => 0,
         properties => {
             node => get_standard_option('pve-node'),
+            fuse => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "Also trace containers reaching the disks through"
+                    . " a FUSE pool such as mergerfs. Costs a few hundred ms to"
+                    . " find which processes hold files open, so it is opt in.",
+            },
         },
     },
     returns => {
@@ -578,9 +1281,20 @@ __PACKAGE__->register_method({
                 description => "Physical disks with their /proc/diskstats counters.",
                 items => { type => 'object' },
             },
+            fuse => {
+                type => 'array',
+                description => "Containers reaching the disks through a FUSE"
+                    . " pool such as mergerfs, which the block layer credits to"
+                    . " the FUSE daemon rather than to them. Counters are"
+                    . " syscall level (rchar/wchar), so they are not comparable"
+                    . " with the block level figures in 'guests'.",
+                items => { type => 'object' },
+            },
             guests => {
                 type => 'array',
-                description => "Running guests with the I/O they are responsible for.",
+                description => "Everything accounted for the node's disk I/O:"
+                    . " running guests, plus host systemd units, which is where"
+                    . " work like mergerfs or a backup job shows up.",
                 items => { type => 'object' },
             },
         },
@@ -619,11 +1333,17 @@ __PACKAGE__->register_method({
         my $guests = [];
         push @$guests, @{ _lxc_guests($physical, $meta->{lxc}) };
         push @$guests, @{ _qemu_guests($meta->{qemu}) };
+        push @$guests, @{ _host_consumers($physical) };
+
+        # Off by default: the holder scan costs a few hundred ms, which is not
+        # worth paying on every poll for a node with no FUSE pool in play.
+        my $fuse = $param->{fuse} ? (eval { _fuse_consumers($physical, $cache) } // []) : [];
 
         return {
             time => $now,
             disks => $disks,
             guests => $guests,
+            fuse => $fuse,
         };
     },
 });
