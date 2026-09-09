@@ -1615,19 +1615,24 @@ Ext.onReady(function () {
             });
 
             // Put the picker in the chart's own header, beside the title and
-            // legend, so the whole thing reads as one window rather than a
-            // chart with a toolbar bolted on top.
+            // so the whole thing reads as one window rather than a chart with a
+            // toolbar bolted on top.
             let header = chart.getHeader();
             if (header) {
                 header.insert(1, me.buildPicker());
 
-                // The legend flexes to fill the header, and with one entry per
-                // guest it squeezes the title to zero width -- which loses the
-                // graph's name on a page where several graphs are stacked.
-                let title = header.down('title');
-                if (title && title.setMinWidth) {
-                    title.setMinWidth(150);
-                    title.setFlex(0);
+                // RRDChart parks its legend in the panel header. That is fine
+                // for two series, but with one entry per disk or per guest it
+                // measured 825px of a 1158px header and squeezed the title down
+                // to 67px, so both graphs arrived on the Summary page with no
+                // readable name. Constraining the title only moves the problem
+                // to the legend, so the legend is docked under the chart
+                // instead, where it has the full width to wrap into.
+                let legend = header.down('legend');
+                if (legend) {
+                    header.remove(legend, false);
+                    legend.dock = 'bottom';
+                    chart.addDocked(legend);
                 }
             }
 
