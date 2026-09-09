@@ -31,5 +31,15 @@ testing repo, and maintainers promote it once accepted.
 - `uninstall` uses `apt remove`, not `purge`, so recorded history survives a
   reinstall.
 
-Tested end to end on Proxmox VE 9.2: `status`, `uninstall`, then `install`
-pulling the release and restoring the panel.
+## Verification
+
+- **ShellCheck 0.11.0: clean**, zero findings, both with default rules and with
+  the project's own `.shellcheckrc` applied. Their `.shellcheckrc` does not
+  disable SC1090 and every one of their own tools trips it via
+  `source <(curl ...)`; two `# shellcheck source=/dev/null` directives silence
+  it here rather than relying on that being tolerated.
+- Tested end to end on Proxmox VE 9.2: `status`, `uninstall`, then `install`
+  pulling the release back down and restoring the panel and its endpoints.
+
+Every shell script in this repository is also ShellCheck clean under default
+rules.
