@@ -8,6 +8,9 @@ the web UI rather than bolted on beside it.
 
 ![The I/O Activity panel](docs/img/io-activity.png)
 
+<sub>Screenshots are real data from a live node, with guest names and disk models
+anonymised.</sub>
+
 It also sees through **mergerfs and other FUSE pools**, which is the case stock
 tooling gets most wrong. A container writing to a pool never touches a block
 device itself, so the kernel — and every tool built on it — credits the pool's
@@ -55,7 +58,7 @@ Reading it:
   daemon and handed to it. More on that below.
 - Selecting a disk rescopes the consumer list to that disk alone, so *"what is
   hammering sdb?"* is one click.
-- Host processes appear too — `rebalance` and `pvestatd` in the shot are
+- Host processes appear too — `media-sync` and `pvestatd` in the shot are
   systemd units, not guests. A script moving media is as much a consumer of a
   disk as any container.
 
@@ -92,8 +95,8 @@ Every LXC and VM gets its own page, next to the hardware it describes.
 
 **Share of disk** is the useful column: how much of *that disk's* traffic is
 this guest. In the shot `sdh` is 100% — this container is the only thing
-touching it — while `sdg` is 44%, because it is competing with two other
-consumers.
+touching it — while `sdg` is 21%, because it is competing with other
+consumers for that spindle.
 
 ### Any guest → Summary → Disk I/O by Disk
 
@@ -183,7 +186,7 @@ and so does every cgroup built on it, which means so does Proxmox, `iotop`,
 
 Left alone, the panel would truthfully report
 
-> `/mnt/storage (mergerfs)` is writing 58 MB/s to `sdh`
+> `/mnt/pool (mergerfs)` is writing 113 MB/s to `sdf`
 
 while hiding the only thing worth knowing, which is who asked it to.
 
@@ -196,19 +199,19 @@ and as a disk's **Top Consumer**:
 
 | Disk | Stock view | Here |
 | --- | --- | --- |
-| sdh | `/mnt/storage (mergerfs)` | **sabnzbd (3130)** — 97% |
-| sdg | `/mnt/storage (mergerfs)` | **sabnzbd (3130)** — 86% |
-| sdf | `/mnt/storage (mergerfs)` | **plex (3111)** — 100% |
-| sdc | `/mnt/storage (mergerfs)` | **rebalance (rebalance-runner)** — 69% |
+| sdf | `/mnt/pool (mergerfs)` | **usenet-client (204)** |
+| sdg | `/mnt/pool (mergerfs)` | **usenet-client (204)** |
+| sdb | `/mnt/pool (mergerfs)` | **media-sync** — a host unit |
+| sdc | `/mnt/pool (mergerfs)` | **media-sync** — a host unit |
 
-Host callers count too: a rebalance script pooling media is as much a consumer
-as a container is.
+Host callers count too: a script pooling media is as much a consumer as a
+container is, and shows up by name beside them.
 
 ### How it works
 
 - **Callers are found by matching open descriptors on the pool's `st_dev`**,
   not on a path prefix. A container sees the pool at its own mountpoint —
-  `/storage` in one, `/mnt/storage` in another — so matching on the path finds
+  `/storage` in one, `/mnt/pool` in another — so matching on the path finds
   nothing. Matching on the filesystem finds them all.
 - **The disk behind each file comes from mergerfs's own
   `user.mergerfs.basepath` xattr**, resolved through the mount table. That is
