@@ -108,6 +108,37 @@ Finding which processes hold files open costs ~500ms, so that scan is cached for
 Untick **Trace FUSE pool** to skip it entirely, at the cost of the daemon
 reappearing as the consumer.
 
+## Per-guest views
+
+Every LXC and VM gets a **Disk I/O** page of its own, next to the hardware it
+describes (after Resources for a container, after Hardware for a VM). It shows
+which physical disks that guest is touching right now, at what rate, and what
+share of each disk's total traffic it accounts for. Because it runs the same
+attribution as the node panel, I/O the guest does *through* a storage pool is
+credited to the guest rather than to the pool's daemon.
+
+Each guest's **Summary** also gains a *Disk I/O by Disk* graph. PVE already
+graphs a guest's total read/write there; this adds which spindle it landed on,
+which the stock guest RRDs cannot express.
+
+That per-disk history needs its own collection, in one RRD per (guest, disk)
+under `/var/lib/pve-disk-io/rrd/<node>/guests/`. Unlike the per-disk RRDs these
+hold GAUGE rates rather than DERIVE counters: I/O reaching a disk through a
+FUSE pool has to be apportioned between the pool's callers, and a share is a
+rate, not something with a monotonic total behind it. The collector therefore
+keeps the previous sample and computes over the whole interval; a gap outside
+30-180s is skipped rather than averaged across, so a stopped collector or a
+reboot cannot invent a plateau.
+
+The apportioning lives in `PVE::DiskIO::attribute_io`, which is the same
+algorithm as `distributePoolIO()` in the panel. The panel computes rates in the
+browser so the API can stay stateless, and the collector cannot reuse that, so
+both carry a note that they must be kept in step.
+
+Host consumers are deliberately not recorded here -- this is guest history and
+the charts are keyed on vmid -- so a host script like a rebalance job shows up
+in the live panel but not in guest history.
+
 ## How the numbers are produced
 
 The API returns raw monotonic counters plus a high-resolution timestamp; the

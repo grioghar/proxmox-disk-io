@@ -110,6 +110,430 @@ Ext.onReady(function () {
             return delta > 0 ? delta / dt : 0;
         },
 
+
+        // Work out who is responsible for each disk's traffic, given two
+        // samples. Shared by the node panel and the per-guest pages so there is
+        // one implementation of the attribution rather than two that drift.
+        //
+        // opts: { selectedDisk, activeHostUnits }
+        // returns { rows, perDisk, diskGuestRate, prevDisks }
+        buildConsumers: function (current, previous, dt, opts) {
+            let U = PVE.node.DiskIOUtils;
+            opts = opts || {};
+            opts.activeHostUnits = opts.activeHostUnits || {};
+
+            let prevDisks = {};
+            previous.disks.forEach((d) => {
+                prevDisks[d.devno] = d;
+            });
+
+            let prevGuests = {};
+            previous.guests.forEach((g) => {
+                prevGuests[g.id] = g;
+            });
+
+            let byId = {};
+            current.guests.forEach((g) => {
+                byId[g.id] = g;
+            });
+
+            // --- per consumer, and per (consumer, disk) --------------------
+            let guestRows = [];
+            let rowsById = {};
+            let perDisk = {}; // devno -> [{name, rate}]
+            let diskGuestRate = {}; // devno -> total attributed rate
+            let perConsumerDisk = {}; // consumer id -> devno -> {read, write}
+
+            let charge = function (id, devno, read, write) {
+                let byDisk = (perConsumerDisk[id] = perConsumerDisk[id] || {});
+                let entry = (byDisk[devno] = byDisk[devno] || { read: 0, write: 0 });
+                entry.read += read;
+                entry.write += write;
+            };
+
+            // A FUSE daemon does none of this work for itself. Its block level
+            // bytes are held back here and handed to whoever asked for them.
+            let poolRates = {}; // devno -> {read, write}
+            let poolNames = {};
+
+            let credit = function (devno, label, rate) {
+                if (rate <= 0) {
+                    return;
+                }
+                (perDisk[devno] = perDisk[devno] || []).push({ name: label, rate: rate });
+                diskGuestRate[devno] = (diskGuestRate[devno] || 0) + rate;
+            };
+
+            current.guests.forEach((guest) => {
+                let before = prevGuests[guest.id];
+                if (!before) {
+                    return;
+                }
+
+                if (guest.pool) {
+                    // Keyed by mountpoint, not by the daemon's name: the point
+                    // of this is that the daemon never appears as a consumer.
+                    poolNames[guest.pool] = guest.pool;
+                    Object.keys(guest.devices || {}).forEach((devno) => {
+                        let cur = guest.devices[devno];
+                        let old = (before.devices || {})[devno];
+                        if (!old) {
+                            return;
+                        }
+                        let entry = (poolRates[devno] = poolRates[devno] || {
+                            read: 0,
+                            write: 0,
+                            readIops: 0,
+                            writeIops: 0,
+                        });
+                        entry.read += U.rate(cur.rbytes, old.rbytes, dt);
+                        entry.write += U.rate(cur.wbytes, old.wbytes, dt);
+                        entry.readIops += U.rate(cur.rios, old.rios, dt);
+                        entry.writeIops += U.rate(cur.wios, old.wios, dt);
+                    });
+                    return;
+                }
+
+                // Host units have no vmid, so the disk grid's label falls back
+                // to just the name.
+                let label = guest.vmid ? guest.name + ' (' + guest.vmid + ')' : guest.name;
+
+                Object.keys(guest.devices || {}).forEach((devno) => {
+                    let cur = guest.devices[devno];
+                    let old = (before.devices || {})[devno];
+                    if (!old) {
+                        return;
+                    }
+                    let read = U.rate(cur.rbytes, old.rbytes, dt);
+                    let write = U.rate(cur.wbytes, old.wbytes, dt);
+                    credit(devno, label, read + write);
+                    charge(guest.id, devno, read, write);
+                });
+
+                let readRate;
+                let writeRate;
+                let readIops;
+                let writeIops;
+
+                if (opts.selectedDisk) {
+                    let cur = (guest.devices || {})[opts.selectedDisk];
+                    let old = (before.devices || {})[opts.selectedDisk];
+                    if (!cur || !old) {
+                        return;
+                    }
+                    readRate = U.rate(cur.rbytes, old.rbytes, dt);
+                    writeRate = U.rate(cur.wbytes, old.wbytes, dt);
+                    readIops = U.rate(cur.rios, old.rios, dt);
+                    writeIops = U.rate(cur.wios, old.wios, dt);
+                } else {
+                    readRate = U.rate(guest.rbytes, before.rbytes, dt);
+                    writeRate = U.rate(guest.wbytes, before.wbytes, dt);
+                    readIops = U.rate(guest.rios, before.rios, dt);
+                    writeIops = U.rate(guest.wios, before.wios, dt);
+                }
+
+                // A guest belongs in the list whether or not it is busy -- it
+                // is a thing you expect to find. There are ~60 host units and
+                // most never touch a disk, so they earn their row by doing I/O
+                // once. They then keep it: adding and removing rows on every
+                // poll made the grid jump under the pointer.
+                if (guest.type === 'host') {
+                    if (readRate + writeRate > 0) {
+                        opts.activeHostUnits[guest.id] = true;
+                    }
+                    if (!opts.activeHostUnits[guest.id]) {
+                        return;
+                    }
+                }
+
+                let disks = Object.keys(guest.devices || {})
+                    .map((devno) => (prevDisks[devno] || {}).dev || devno)
+                    .sort();
+
+                let row = {
+                    id: guest.id,
+                    vmid: guest.vmid,
+                    name: guest.name,
+                    type: guest.type,
+                    source: guest.source,
+                    partial: !!guest.partial,
+                    viaPool: false,
+                    readRate: readRate,
+                    writeRate: writeRate,
+                    totalRate: readRate + writeRate,
+                    readIops: readIops,
+                    writeIops: writeIops,
+                    iops: readIops + writeIops,
+                    share: 0,
+                    disks: disks,
+                };
+                rowsById[guest.id] = row;
+                guestRows.push(row);
+            });
+
+            // --- hand the pool's bytes to whoever asked for them ------------
+            PVE.node.DiskIOUtils.distributePoolIO(current, previous, dt, {
+                poolRates: poolRates,
+                poolNames: poolNames,
+                rowsById: rowsById,
+                guestRows: guestRows,
+                byId: byId,
+                prevDisks: prevDisks,
+                credit: credit,
+                charge: charge,
+            }, opts);
+
+            guestRows.forEach((row) => {
+                let names = (row.disks || []).slice().sort();
+                row.disks =
+                    names.length > 3
+                        ? names.slice(0, 3).join(', ') + ' +' + (names.length - 3)
+                        : names.join(', ');
+            });
+
+            let guestTotal = guestRows.reduce((sum, row) => sum + row.totalRate, 0);
+            guestRows.forEach((row) => {
+                row.share = guestTotal > 0 ? row.totalRate / guestTotal : 0;
+            });
+
+            return {
+                rows: guestRows,
+                perDisk: perDisk,
+                perConsumerDisk: perConsumerDisk,
+                diskGuestRate: diskGuestRate,
+                prevDisks: prevDisks,
+            };
+        },
+
+        // A FUSE pool daemon does no work of its own: every byte it moves was
+        // asked for by a container or a host process. The block layer cannot
+        // see that, so the daemon's per disk bytes are shared out here among
+        // the callers using the pool, in proportion to what each of them
+        // actually read and wrote through it.
+        //
+        // The quantity handed out is block level throughout -- only the split
+        // comes from syscall counters -- so the per disk totals still add up to
+        // what the disk really did.
+        distributePoolIO: function (current, previous, dt, ctx, opts) {
+            opts = opts || {};
+            let U = PVE.node.DiskIOUtils;
+
+            let devnos = Object.keys(ctx.poolRates);
+            if (!devnos.length) {
+                return;
+            }
+
+            // Aggregate by owner rather than by pid. Pids churn constantly here
+            // -- a transcode or an unpack is a fresh process every time -- and
+            // matching on them meant a caller vanished from the comparison the
+            // moment its pid changed, which sent its disk's whole load into the
+            // unattributed bucket.
+            let byOwner = function (list) {
+                let out = {};
+                (list || []).forEach((entry) => {
+                    let ownerId =
+                        entry.type === 'lxc' ? 'lxc:' + entry.vmid : 'host:' + entry.unit;
+                    let owner = (out[ownerId] = out[ownerId] || {
+                        ownerId: ownerId,
+                        comm: entry.comm,
+                        rchar: 0,
+                        wchar: 0,
+                        weights: {},
+                    });
+                    owner.rchar += entry.rchar || 0;
+                    owner.wchar += entry.wchar || 0;
+                    Object.keys(entry.weights || {}).forEach((devno) => {
+                        owner.weights[devno] =
+                            (owner.weights[devno] || 0) + entry.weights[devno];
+                    });
+                });
+                return out;
+            };
+
+            let before = byOwner(previous.fuse);
+            let now = byOwner(current.fuse);
+
+            let owners = [];
+            Object.keys(now).forEach((ownerId) => {
+                let cur = now[ownerId];
+                let old = before[ownerId];
+                if (!old) {
+                    return;
+                }
+
+                let read = U.rate(cur.rchar, old.rchar, dt);
+                let write = U.rate(cur.wchar, old.wchar, dt);
+                if (read + write <= 0) {
+                    return;
+                }
+
+                let totalWeight = Object.keys(cur.weights).reduce(
+                    (sum, devno) => sum + cur.weights[devno],
+                    0,
+                );
+
+                owners.push({
+                    ownerId: ownerId,
+                    comm: cur.comm,
+                    read: read,
+                    write: write,
+                    weights: cur.weights,
+                    totalWeight: totalWeight,
+                });
+            });
+
+            let residual = { read: 0, write: 0, disks: {} };
+
+            let rowFor = function (owner) {
+                let row = ctx.rowsById[owner.ownerId];
+                if (row) {
+                    return row;
+                }
+
+                // The caller does no block I/O of its own, so the main pass
+                // never gave it a row -- everything it does goes via the pool.
+                let known = ctx.byId[owner.ownerId] || {};
+                row = {
+                    id: owner.ownerId,
+                    vmid: known.vmid,
+                    name: known.name || owner.comm,
+                    type: known.type || (owner.ownerId.indexOf('lxc:') === 0 ? 'lxc' : 'host'),
+                    source: 'pool',
+                    partial: false,
+                    viaPool: true,
+                    readRate: 0,
+                    writeRate: 0,
+                    totalRate: 0,
+                    readIops: 0,
+                    writeIops: 0,
+                    iops: 0,
+                    share: 0,
+                    disks: [],
+                };
+                ctx.rowsById[owner.ownerId] = row;
+                ctx.guestRows.push(row);
+                return row;
+            };
+
+            devnos.forEach((devno) => {
+                if (opts.selectedDisk && devno !== opts.selectedDisk) {
+                    return;
+                }
+
+                let pool = ctx.poolRates[devno];
+                if (pool.read + pool.write <= 0) {
+                    return;
+                }
+
+                // Prefer callers with files open on this disk. Failing that,
+                // fall back to every active caller: writeback happens long
+                // after the write, often once the file is closed, so insisting
+                // on a live descriptor would blame nobody for real work that a
+                // real container caused.
+                let onDisk = owners
+                    .filter((o) => o.totalWeight > 0 && (o.weights[devno] || 0) > 0)
+                    .map((o) => ({ owner: o, fraction: o.weights[devno] / o.totalWeight }));
+
+                let shares = onDisk.length
+                    ? onDisk
+                    : owners.map((o) => ({ owner: o, fraction: 1 }));
+
+                if (!shares.length) {
+                    // Nothing is using the pool at all, so there is genuinely
+                    // no one to credit. Dropping it would leave the disk's
+                    // numbers not adding up, so it is kept as its own row.
+                    residual.read += pool.read;
+                    residual.write += pool.write;
+                    residual.disks[devno] = true;
+                    return;
+                }
+
+                let readWeight = shares.reduce((sum, s) => sum + s.owner.read * s.fraction, 0);
+                let writeWeight = shares.reduce((sum, s) => sum + s.owner.write * s.fraction, 0);
+                let anyWeight = shares.reduce(
+                    (sum, s) => sum + (s.owner.read + s.owner.write) * s.fraction,
+                    0,
+                );
+
+                let dev = (ctx.prevDisks[devno] || {}).dev || devno;
+
+                shares.forEach((share) => {
+                    let combined = (share.owner.read + share.owner.write) * share.fraction;
+
+                    // Split reads by who was reading and writes by who was
+                    // writing. When one side has no signal at all, fall back to
+                    // overall activity rather than discarding those bytes.
+                    let readShare =
+                        readWeight > 0
+                            ? (share.owner.read * share.fraction) / readWeight
+                            : anyWeight > 0
+                              ? combined / anyWeight
+                              : 0;
+                    let writeShare =
+                        writeWeight > 0
+                            ? (share.owner.write * share.fraction) / writeWeight
+                            : anyWeight > 0
+                              ? combined / anyWeight
+                              : 0;
+
+                    let read = pool.read * readShare;
+                    let write = pool.write * writeShare;
+
+                    if (read + write <= 0) {
+                        return;
+                    }
+
+                    // The daemon's cgroup counts operations as well as bytes,
+                    // so IOPS can be shared out on exactly the same split.
+                    // Without this a consumer whose I/O is entirely via the
+                    // pool reported no IOPS at all.
+                    let readIops = (pool.readIops || 0) * readShare;
+                    let writeIops = (pool.writeIops || 0) * writeShare;
+
+                    let row = rowFor(share.owner);
+                    row.readRate += read;
+                    row.writeRate += write;
+                    row.totalRate += read + write;
+                    row.readIops += readIops;
+                    row.writeIops += writeIops;
+                    row.iops += readIops + writeIops;
+                    row.viaPool = true;
+                    if (row.disks.indexOf(dev) === -1) {
+                        row.disks.push(dev);
+                    }
+
+                    let label = row.vmid ? row.name + ' (' + row.vmid + ')' : row.name;
+                    ctx.credit(devno, label, read + write);
+                    ctx.charge(row.id, devno, read, write);
+                });
+            });
+
+            if (residual.read + residual.write > 500000) {
+                let poolName = Object.keys(ctx.poolNames).map((k) => ctx.poolNames[k])[0] || 'pool';
+                let disks = Object.keys(residual.disks).map(
+                    (devno) => (ctx.prevDisks[devno] || {}).dev || devno,
+                );
+
+                ctx.guestRows.push({
+                    id: 'pool:unattributed',
+                    vmid: undefined,
+                    name: Ext.String.format(gettext('{0} (no active caller)'), poolName),
+                    type: 'host',
+                    source: 'pool',
+                    partial: false,
+                    viaPool: true,
+                    readRate: residual.read,
+                    writeRate: residual.write,
+                    totalRate: residual.read + residual.write,
+                    readIops: 0,
+                    writeIops: 0,
+                    iops: 0,
+                    share: 0,
+                    disks: disks,
+                });
+            }
+        },
+
         renderRate: function (value) {
             if (!value) {
                 return '<span class="pve-diskio-idle">0</span>';
@@ -809,171 +1233,14 @@ Ext.onReady(function () {
             let me = this;
             let U = PVE.node.DiskIOUtils;
 
-            let prevDisks = {};
-            previous.disks.forEach((d) => {
-                prevDisks[d.devno] = d;
+            let consumers = U.buildConsumers(current, previous, dt, {
+                selectedDisk: me.selectedDisk,
+                activeHostUnits: me.activeHostUnits,
             });
-
-            let prevGuests = {};
-            previous.guests.forEach((g) => {
-                prevGuests[g.id] = g;
-            });
-
-            let byId = {};
-            current.guests.forEach((g) => {
-                byId[g.id] = g;
-            });
-
-            // --- per consumer, and per (consumer, disk) --------------------
-            let guestRows = [];
-            let rowsById = {};
-            let perDisk = {}; // devno -> [{name, rate}]
-            let diskGuestRate = {}; // devno -> total attributed rate
-
-            // A FUSE daemon does none of this work for itself. Its block level
-            // bytes are held back here and handed to whoever asked for them.
-            let poolRates = {}; // devno -> {read, write}
-            let poolNames = {};
-
-            let credit = function (devno, label, rate) {
-                if (rate <= 0) {
-                    return;
-                }
-                (perDisk[devno] = perDisk[devno] || []).push({ name: label, rate: rate });
-                diskGuestRate[devno] = (diskGuestRate[devno] || 0) + rate;
-            };
-
-            current.guests.forEach((guest) => {
-                let before = prevGuests[guest.id];
-                if (!before) {
-                    return;
-                }
-
-                if (guest.pool) {
-                    // Keyed by mountpoint, not by the daemon's name: the point
-                    // of this is that the daemon never appears as a consumer.
-                    poolNames[guest.pool] = guest.pool;
-                    Object.keys(guest.devices || {}).forEach((devno) => {
-                        let cur = guest.devices[devno];
-                        let old = (before.devices || {})[devno];
-                        if (!old) {
-                            return;
-                        }
-                        let entry = (poolRates[devno] = poolRates[devno] || {
-                            read: 0,
-                            write: 0,
-                            readIops: 0,
-                            writeIops: 0,
-                        });
-                        entry.read += U.rate(cur.rbytes, old.rbytes, dt);
-                        entry.write += U.rate(cur.wbytes, old.wbytes, dt);
-                        entry.readIops += U.rate(cur.rios, old.rios, dt);
-                        entry.writeIops += U.rate(cur.wios, old.wios, dt);
-                    });
-                    return;
-                }
-
-                // Host units have no vmid, so the disk grid's label falls back
-                // to just the name.
-                let label = guest.vmid ? guest.name + ' (' + guest.vmid + ')' : guest.name;
-
-                Object.keys(guest.devices || {}).forEach((devno) => {
-                    let cur = guest.devices[devno];
-                    let old = (before.devices || {})[devno];
-                    if (!old) {
-                        return;
-                    }
-                    credit(
-                        devno,
-                        label,
-                        U.rate(cur.rbytes, old.rbytes, dt) + U.rate(cur.wbytes, old.wbytes, dt),
-                    );
-                });
-
-                let readRate;
-                let writeRate;
-                let readIops;
-                let writeIops;
-
-                if (me.selectedDisk) {
-                    let cur = (guest.devices || {})[me.selectedDisk];
-                    let old = (before.devices || {})[me.selectedDisk];
-                    if (!cur || !old) {
-                        return;
-                    }
-                    readRate = U.rate(cur.rbytes, old.rbytes, dt);
-                    writeRate = U.rate(cur.wbytes, old.wbytes, dt);
-                    readIops = U.rate(cur.rios, old.rios, dt);
-                    writeIops = U.rate(cur.wios, old.wios, dt);
-                } else {
-                    readRate = U.rate(guest.rbytes, before.rbytes, dt);
-                    writeRate = U.rate(guest.wbytes, before.wbytes, dt);
-                    readIops = U.rate(guest.rios, before.rios, dt);
-                    writeIops = U.rate(guest.wios, before.wios, dt);
-                }
-
-                // A guest belongs in the list whether or not it is busy -- it
-                // is a thing you expect to find. There are ~60 host units and
-                // most never touch a disk, so they earn their row by doing I/O
-                // once. They then keep it: adding and removing rows on every
-                // poll made the grid jump under the pointer.
-                if (guest.type === 'host') {
-                    if (readRate + writeRate > 0) {
-                        me.activeHostUnits[guest.id] = true;
-                    }
-                    if (!me.activeHostUnits[guest.id]) {
-                        return;
-                    }
-                }
-
-                let disks = Object.keys(guest.devices || {})
-                    .map((devno) => (prevDisks[devno] || {}).dev || devno)
-                    .sort();
-
-                let row = {
-                    id: guest.id,
-                    vmid: guest.vmid,
-                    name: guest.name,
-                    type: guest.type,
-                    source: guest.source,
-                    partial: !!guest.partial,
-                    viaPool: false,
-                    readRate: readRate,
-                    writeRate: writeRate,
-                    totalRate: readRate + writeRate,
-                    readIops: readIops,
-                    writeIops: writeIops,
-                    iops: readIops + writeIops,
-                    share: 0,
-                    disks: disks,
-                };
-                rowsById[guest.id] = row;
-                guestRows.push(row);
-            });
-
-            // --- hand the pool's bytes to whoever asked for them ------------
-            me.distributePoolIO(current, previous, dt, {
-                poolRates: poolRates,
-                poolNames: poolNames,
-                rowsById: rowsById,
-                guestRows: guestRows,
-                byId: byId,
-                prevDisks: prevDisks,
-                credit: credit,
-            });
-
-            guestRows.forEach((row) => {
-                let names = (row.disks || []).slice().sort();
-                row.disks =
-                    names.length > 3
-                        ? names.slice(0, 3).join(', ') + ' +' + (names.length - 3)
-                        : names.join(', ');
-            });
-
-            let guestTotal = guestRows.reduce((sum, row) => sum + row.totalRate, 0);
-            guestRows.forEach((row) => {
-                row.share = guestTotal > 0 ? row.totalRate / guestTotal : 0;
-            });
+            let guestRows = consumers.rows;
+            let perDisk = consumers.perDisk;
+            let diskGuestRate = consumers.diskGuestRate;
+            let prevDisks = consumers.prevDisks;
 
             // --- per disk ---------------------------------------------------
             let totals = { read: 0, write: 0, iops: 0 };
@@ -1053,234 +1320,6 @@ Ext.onReady(function () {
 
             me.pushChartSample(current.time, totals.read, totals.write);
             me.refreshSummary(totals, busiest, guestRows);
-        },
-
-        // A FUSE pool daemon does no work of its own: every byte it moves was
-        // asked for by a container or a host process. The block layer cannot
-        // see that, so the daemon's per disk bytes are shared out here among
-        // the callers using the pool, in proportion to what each of them
-        // actually read and wrote through it.
-        //
-        // The quantity handed out is block level throughout -- only the split
-        // comes from syscall counters -- so the per disk totals still add up to
-        // what the disk really did.
-        distributePoolIO: function (current, previous, dt, ctx) {
-            let me = this;
-            let U = PVE.node.DiskIOUtils;
-
-            let devnos = Object.keys(ctx.poolRates);
-            if (!devnos.length) {
-                return;
-            }
-
-            // Aggregate by owner rather than by pid. Pids churn constantly here
-            // -- a transcode or an unpack is a fresh process every time -- and
-            // matching on them meant a caller vanished from the comparison the
-            // moment its pid changed, which sent its disk's whole load into the
-            // unattributed bucket.
-            let byOwner = function (list) {
-                let out = {};
-                (list || []).forEach((entry) => {
-                    let ownerId =
-                        entry.type === 'lxc' ? 'lxc:' + entry.vmid : 'host:' + entry.unit;
-                    let owner = (out[ownerId] = out[ownerId] || {
-                        ownerId: ownerId,
-                        comm: entry.comm,
-                        rchar: 0,
-                        wchar: 0,
-                        weights: {},
-                    });
-                    owner.rchar += entry.rchar || 0;
-                    owner.wchar += entry.wchar || 0;
-                    Object.keys(entry.weights || {}).forEach((devno) => {
-                        owner.weights[devno] =
-                            (owner.weights[devno] || 0) + entry.weights[devno];
-                    });
-                });
-                return out;
-            };
-
-            let before = byOwner(previous.fuse);
-            let now = byOwner(current.fuse);
-
-            let owners = [];
-            Object.keys(now).forEach((ownerId) => {
-                let cur = now[ownerId];
-                let old = before[ownerId];
-                if (!old) {
-                    return;
-                }
-
-                let read = U.rate(cur.rchar, old.rchar, dt);
-                let write = U.rate(cur.wchar, old.wchar, dt);
-                if (read + write <= 0) {
-                    return;
-                }
-
-                let totalWeight = Object.keys(cur.weights).reduce(
-                    (sum, devno) => sum + cur.weights[devno],
-                    0,
-                );
-
-                owners.push({
-                    ownerId: ownerId,
-                    comm: cur.comm,
-                    read: read,
-                    write: write,
-                    weights: cur.weights,
-                    totalWeight: totalWeight,
-                });
-            });
-
-            let residual = { read: 0, write: 0, disks: {} };
-
-            let rowFor = function (owner) {
-                let row = ctx.rowsById[owner.ownerId];
-                if (row) {
-                    return row;
-                }
-
-                // The caller does no block I/O of its own, so the main pass
-                // never gave it a row -- everything it does goes via the pool.
-                let known = ctx.byId[owner.ownerId] || {};
-                row = {
-                    id: owner.ownerId,
-                    vmid: known.vmid,
-                    name: known.name || owner.comm,
-                    type: known.type || (owner.ownerId.indexOf('lxc:') === 0 ? 'lxc' : 'host'),
-                    source: 'pool',
-                    partial: false,
-                    viaPool: true,
-                    readRate: 0,
-                    writeRate: 0,
-                    totalRate: 0,
-                    readIops: 0,
-                    writeIops: 0,
-                    iops: 0,
-                    share: 0,
-                    disks: [],
-                };
-                ctx.rowsById[owner.ownerId] = row;
-                ctx.guestRows.push(row);
-                return row;
-            };
-
-            devnos.forEach((devno) => {
-                if (me.selectedDisk && devno !== me.selectedDisk) {
-                    return;
-                }
-
-                let pool = ctx.poolRates[devno];
-                if (pool.read + pool.write <= 0) {
-                    return;
-                }
-
-                // Prefer callers with files open on this disk. Failing that,
-                // fall back to every active caller: writeback happens long
-                // after the write, often once the file is closed, so insisting
-                // on a live descriptor would blame nobody for real work that a
-                // real container caused.
-                let onDisk = owners
-                    .filter((o) => o.totalWeight > 0 && (o.weights[devno] || 0) > 0)
-                    .map((o) => ({ owner: o, fraction: o.weights[devno] / o.totalWeight }));
-
-                let shares = onDisk.length
-                    ? onDisk
-                    : owners.map((o) => ({ owner: o, fraction: 1 }));
-
-                if (!shares.length) {
-                    // Nothing is using the pool at all, so there is genuinely
-                    // no one to credit. Dropping it would leave the disk's
-                    // numbers not adding up, so it is kept as its own row.
-                    residual.read += pool.read;
-                    residual.write += pool.write;
-                    residual.disks[devno] = true;
-                    return;
-                }
-
-                let readWeight = shares.reduce((sum, s) => sum + s.owner.read * s.fraction, 0);
-                let writeWeight = shares.reduce((sum, s) => sum + s.owner.write * s.fraction, 0);
-                let anyWeight = shares.reduce(
-                    (sum, s) => sum + (s.owner.read + s.owner.write) * s.fraction,
-                    0,
-                );
-
-                let dev = (ctx.prevDisks[devno] || {}).dev || devno;
-
-                shares.forEach((share) => {
-                    let combined = (share.owner.read + share.owner.write) * share.fraction;
-
-                    // Split reads by who was reading and writes by who was
-                    // writing. When one side has no signal at all, fall back to
-                    // overall activity rather than discarding those bytes.
-                    let readShare =
-                        readWeight > 0
-                            ? (share.owner.read * share.fraction) / readWeight
-                            : anyWeight > 0
-                              ? combined / anyWeight
-                              : 0;
-                    let writeShare =
-                        writeWeight > 0
-                            ? (share.owner.write * share.fraction) / writeWeight
-                            : anyWeight > 0
-                              ? combined / anyWeight
-                              : 0;
-
-                    let read = pool.read * readShare;
-                    let write = pool.write * writeShare;
-
-                    if (read + write <= 0) {
-                        return;
-                    }
-
-                    // The daemon's cgroup counts operations as well as bytes,
-                    // so IOPS can be shared out on exactly the same split.
-                    // Without this a consumer whose I/O is entirely via the
-                    // pool reported no IOPS at all.
-                    let readIops = (pool.readIops || 0) * readShare;
-                    let writeIops = (pool.writeIops || 0) * writeShare;
-
-                    let row = rowFor(share.owner);
-                    row.readRate += read;
-                    row.writeRate += write;
-                    row.totalRate += read + write;
-                    row.readIops += readIops;
-                    row.writeIops += writeIops;
-                    row.iops += readIops + writeIops;
-                    row.viaPool = true;
-                    if (row.disks.indexOf(dev) === -1) {
-                        row.disks.push(dev);
-                    }
-
-                    let label = row.vmid ? row.name + ' (' + row.vmid + ')' : row.name;
-                    ctx.credit(devno, label, read + write);
-                });
-            });
-
-            if (residual.read + residual.write > 500000) {
-                let poolName = Object.keys(ctx.poolNames).map((k) => ctx.poolNames[k])[0] || 'pool';
-                let disks = Object.keys(residual.disks).map(
-                    (devno) => (ctx.prevDisks[devno] || {}).dev || devno,
-                );
-
-                ctx.guestRows.push({
-                    id: 'pool:unattributed',
-                    vmid: undefined,
-                    name: Ext.String.format(gettext('{0} (no active caller)'), poolName),
-                    type: 'host',
-                    source: 'pool',
-                    partial: false,
-                    viaPool: true,
-                    readRate: residual.read,
-                    writeRate: residual.write,
-                    totalRate: residual.read + residual.write,
-                    readIops: 0,
-                    writeIops: 0,
-                    iops: 0,
-                    share: 0,
-                    disks: disks,
-                });
-            }
         },
 
         // Update rows in place so the grid keeps its selection, scroll offset
@@ -1502,6 +1541,9 @@ Ext.onReady(function () {
         // rather than only which series are drawn from the same list.
         listDependsOnSelection: false,
 
+        // A chart already scoped to one guest has nothing to pick between.
+        showPicker: true,
+
         // Extra query parameters for the data endpoint, for subclasses whose
         // series depend on more than the timeframe.
         extraDataParams: function () {
@@ -1629,7 +1671,9 @@ Ext.onReady(function () {
             // toolbar bolted on top.
             let header = chart.getHeader();
             if (header) {
-                header.insert(1, me.buildPicker());
+                if (me.showPicker) {
+                    header.insert(1, me.buildPicker());
+                }
 
                 // RRDChart parks its legend in the panel header. That is fine
                 // for two series, but with one entry per disk or per guest it
@@ -1927,6 +1971,405 @@ Ext.onReady(function () {
         },
     });
 
+    // ------------------------------------------------------- per guest views
+
+    // A guest's own disk I/O history, broken out per physical disk. PVE's guest
+    // Summary already graphs total read/write; what it cannot say is which
+    // spindle that landed on.
+    Ext.define('PVE.guest.DiskHistoryChart', {
+        extend: 'PVE.node.IOHistoryChart',
+        alias: 'widget.pveGuestDiskHistoryChart',
+
+        paramName: 'vmid',
+        showPicker: false,
+        rebuildOnTimeframe: true,
+        emptyText: gettext('No per-disk history recorded for this guest yet.'),
+
+        initComponent: function () {
+            let me = this;
+            if (!me.vmid) {
+                throw 'no vmid specified';
+            }
+            me.selected = String(me.vmid);
+            me.callParent();
+        },
+
+        getListUrl: function () {
+            let tf = this.currentTimeframe();
+            return (
+                '/nodes/' +
+                this.nodename +
+                '/disks/io/guestdisklist?vmid=' +
+                this.vmid +
+                '&timeframe=' +
+                tf.timeframe +
+                '&cf=' +
+                tf.cf
+            );
+        },
+
+        getDataUrl: function () {
+            return '/api2/json/nodes/' + this.nodename + '/disks/io/guestdiskrrddata';
+        },
+
+        pickerRows: function () {
+            return [];
+        },
+
+        seriesFor: function (entries) {
+            return {
+                title: gettext('Disk I/O by Disk'),
+                fields: entries.map((d) => d.dev),
+                fieldTitles: entries.map((d) => d.dev),
+                colors: entries.map((d, i) => SERIES_PALETTE[i % SERIES_PALETTE.length]),
+                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
+            };
+        },
+    });
+
+    // The live view for one guest: which disks it is touching right now, and at
+    // what rate. Reads the node endpoint and runs the same attribution the node
+    // panel does, so I/O this guest does through a FUSE pool is credited here
+    // rather than to the pool's daemon.
+    Ext.define('PVE.guest.DiskIO', {
+        extend: 'Ext.panel.Panel',
+        alias: 'widget.pveGuestDiskIO',
+
+        onlineHelp: 'chapter_storage',
+        layout: { type: 'vbox', align: 'stretch' },
+        border: false,
+
+        interval: 3,
+        paused: false,
+        historyLength: 180,
+
+        initComponent: function () {
+            let me = this;
+
+            let nodename = me.nodename || me.pveSelNode?.data?.node;
+            let vmid = me.vmid || me.pveSelNode?.data?.vmid;
+            if (!nodename || !vmid) {
+                throw 'no node name or vmid specified';
+            }
+            me.nodename = nodename;
+            me.vmid = vmid;
+            me.consumerId = (me.guestType === 'lxc' ? 'lxc:' : 'qemu:') + vmid;
+
+            me.diskStore = Ext.create('Ext.data.Store', {
+                fields: [
+                    'dev',
+                    'devno',
+                    'model',
+                    'transport',
+                    'kind',
+                    { name: 'readRate', type: 'number' },
+                    { name: 'writeRate', type: 'number' },
+                    { name: 'totalRate', type: 'number' },
+                    { name: 'share', type: 'number' },
+                ],
+                sorters: [{ property: 'totalRate', direction: 'DESC' }],
+            });
+
+            me.chartStore = Ext.create('Ext.data.Store', {
+                fields: [
+                    { name: 'time', type: 'number' },
+                    { name: 'read', type: 'number' },
+                    { name: 'write', type: 'number' },
+                ],
+                data: [],
+            });
+
+            me.summary = Ext.create('PVE.node.DiskIOSummary');
+
+            me.chart = Ext.create('Proxmox.widget.RRDChart', {
+                title: gettext('Throughput'),
+                store: me.chartStore,
+                fields: ['read', 'write'],
+                fieldTitles: [gettext('Read'), gettext('Write')],
+                colors: ['#115fa6', '#94ae0a'],
+                unit: 'bytespersecond',
+                height: 170,
+                border: false,
+            });
+
+            me.grid = Ext.create('Ext.grid.Panel', {
+                flex: 1,
+                border: false,
+                store: me.diskStore,
+                title: gettext('Disks this guest is using'),
+                emptyText: gettext('Sampling...'),
+                viewConfig: { stripeRows: true, deferEmptyText: false },
+                columns: [
+                    {
+                        text: gettext('Device'),
+                        dataIndex: 'dev',
+                        width: 120,
+                        renderer: PVE.node.DiskIOUtils.renderDevice,
+                    },
+                    {
+                        text: gettext('Bus'),
+                        dataIndex: 'transport',
+                        width: 70,
+                        align: 'center',
+                        renderer: PVE.node.DiskIOUtils.renderBus,
+                    },
+                    {
+                        text: gettext('Model'),
+                        dataIndex: 'model',
+                        flex: 1,
+                        minWidth: 130,
+                        renderer: Ext.String.htmlEncode,
+                    },
+                    {
+                        text: gettext('Read'),
+                        dataIndex: 'readRate',
+                        width: 108,
+                        align: 'right',
+                        renderer: PVE.node.DiskIOUtils.renderReadRate,
+                    },
+                    {
+                        text: gettext('Write'),
+                        dataIndex: 'writeRate',
+                        width: 108,
+                        align: 'right',
+                        renderer: PVE.node.DiskIOUtils.renderWriteRate,
+                    },
+                    {
+                        text: gettext('Share of disk'),
+                        dataIndex: 'share',
+                        width: 110,
+                        xtype: 'widgetcolumn',
+                        widget: { xtype: 'progressbarwidget', textTpl: '{percent:number("0")}%' },
+                    },
+                ],
+            });
+
+            me.items = [me.summary, me.chart, me.grid];
+            me.tbar = me.buildToolbar();
+
+            me.callParent();
+
+            me.on('afterrender', me.startPolling, me);
+            me.on('destroy', me.stopPolling, me);
+        },
+
+        buildToolbar: function () {
+            let me = this;
+            return [
+                {
+                    xtype: 'button',
+                    text: gettext('Pause'),
+                    iconCls: 'fa fa-pause',
+                    handler: function (button) {
+                        me.paused = !me.paused;
+                        button.setText(me.paused ? gettext('Resume') : gettext('Pause'));
+                        button.setIconCls(me.paused ? 'fa fa-play' : 'fa fa-pause');
+                        if (me.paused) {
+                            me.stopPolling();
+                        } else {
+                            me.previous = null;
+                            me.startPolling();
+                        }
+                    },
+                },
+                '->',
+                {
+                    xtype: 'tbtext',
+                    text: gettext('Includes I/O this guest does through a storage pool'),
+                },
+            ];
+        },
+
+        startPolling: function () {
+            let me = this;
+            me.stopPolling();
+            me.poll();
+            me.pollTask = Ext.TaskManager.start({
+                run: me.poll,
+                interval: me.interval * 1000,
+                scope: me,
+            });
+        },
+
+        stopPolling: function () {
+            let me = this;
+            if (me.pollTask) {
+                Ext.TaskManager.stop(me.pollTask);
+                me.pollTask = undefined;
+            }
+        },
+
+        poll: function () {
+            let me = this;
+            if (me.pollInFlight || me.isDestroyed) {
+                return;
+            }
+            me.pollInFlight = true;
+
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.nodename + '/disks/io?fuse=1',
+                method: 'GET',
+                success: function (response) {
+                    me.pollInFlight = false;
+                    if (me.isDestroyed) {
+                        return;
+                    }
+                    Proxmox.Utils.setErrorMask(me.grid, false);
+                    me.consume(response.result.data);
+                },
+                failure: function (response) {
+                    me.pollInFlight = false;
+                    if (me.isDestroyed) {
+                        return;
+                    }
+                    Proxmox.Utils.setErrorMask(me.grid, response.htmlStatus);
+                },
+            });
+        },
+
+        consume: function (sample) {
+            let me = this;
+            let previous = me.previous;
+            me.previous = sample;
+
+            if (!previous) {
+                return;
+            }
+
+            let dt = sample.time - previous.time;
+            if (dt <= 0 || dt > Math.max(30, me.interval * 6)) {
+                return;
+            }
+
+            me.refresh(sample, previous, dt);
+        },
+
+        refresh: function (current, previous, dt) {
+            let me = this;
+            let U = PVE.node.DiskIOUtils;
+
+            let consumers = U.buildConsumers(current, previous, dt, {
+                activeHostUnits: me.activeHostUnits || (me.activeHostUnits = {}),
+            });
+
+            let mine = consumers.perConsumerDisk[me.consumerId] || {};
+            let disks = {};
+            current.disks.forEach((d) => {
+                disks[d.devno] = d;
+            });
+
+            let rows = [];
+            let totals = { read: 0, write: 0 };
+
+            Object.keys(mine).forEach((devno) => {
+                let disk = disks[devno];
+                if (!disk) {
+                    return;
+                }
+                let io = mine[devno];
+                totals.read += io.read;
+                totals.write += io.write;
+
+                // How much of what this disk did was this guest, which is the
+                // question you are really asking on a guest's own page.
+                let diskTotal = consumers.diskGuestRate[devno] || 0;
+                rows.push({
+                    dev: disk.dev,
+                    devno: devno,
+                    model: disk.model,
+                    transport: disk.transport,
+                    kind: disk.kind,
+                    readRate: io.read,
+                    writeRate: io.write,
+                    totalRate: io.read + io.write,
+                    share: diskTotal > 0 ? Math.min(1, (io.read + io.write) / diskTotal) : 0,
+                });
+            });
+
+            me.diskStore.setData(rows);
+
+            me.chartStore.add({ time: current.time * 1000, read: totals.read, write: totals.write });
+            let overflow = me.chartStore.getCount() - me.historyLength;
+            if (overflow > 0) {
+                me.chartStore.remove(me.chartStore.getRange(0, overflow - 1));
+            }
+
+            let busiest = rows.reduce((best, r) => (!best || r.totalRate > best.totalRate ? r : best), null);
+
+            me.summary.update({
+                tiles: [
+                    {
+                        icon: 'fa fa-arrow-down',
+                        label: gettext('Read'),
+                        value: Proxmox.Utils.format_size(totals.read) + '/s',
+                        sub: '',
+                        cls: 'pve-diskio-read',
+                    },
+                    {
+                        icon: 'fa fa-arrow-up',
+                        label: gettext('Write'),
+                        value: Proxmox.Utils.format_size(totals.write) + '/s',
+                        sub: '',
+                        cls: 'pve-diskio-write',
+                    },
+                    {
+                        icon: 'fa fa-hdd-o',
+                        label: gettext('Disks in use'),
+                        value: String(rows.length),
+                        sub: '',
+                        cls: '',
+                    },
+                    {
+                        icon: 'fa fa-tachometer',
+                        label: gettext('Busiest Disk'),
+                        value: busiest ? busiest.dev : '-',
+                        sub: busiest ? Proxmox.Utils.format_size(busiest.totalRate) + '/s' : gettext('idle'),
+                        cls: '',
+                    },
+                ],
+            });
+        },
+    });
+
+
+    // Each guest's Summary already graphs its total read/write. This adds the
+    // per-disk breakdown next to it, which PVE's guest RRDs cannot express.
+    Ext.define('PVE.guest.DiskIOSummaryInjection', {
+        override: 'PVE.guest.Summary',
+
+        initComponent: function () {
+            let me = this;
+
+            me.callParent();
+
+            try {
+                let data = me.pveSelNode.data;
+                // Templates have no graphs at all; do not give them one.
+                if (!data || !data.vmid || data.template) {
+                    return;
+                }
+
+                let container = me.down('#itemcontainer');
+                if (!container || container.down('pveGuestDiskHistoryChart')) {
+                    return;
+                }
+
+                container.add({
+                    xtype: 'pveGuestDiskHistoryChart',
+                    nodename: data.node,
+                    vmid: data.vmid,
+                    minHeight: 360,
+                    padding: 5,
+                    columnWidth: 1,
+                });
+            } catch (err) {
+                if (window.console && window.console.error) {
+                    window.console.error('pve-disk-io: could not add guest summary chart', err);
+                }
+            }
+        },
+    });
+
     // ------------------------------------------------- menu entry injection
 
     // PVE.node.Config builds its item list and then hands it to
@@ -1940,6 +2383,29 @@ Ext.onReady(function () {
             let me = this;
 
             try {
+                // Guests get their own live page, next to the hardware they
+                // describe: Resources for a container, Hardware for a VM.
+                let guest = { 'PVE.lxc.Config': 'resources', 'PVE.qemu.Config': 'hardware' };
+                if (guest[me.$className] && Ext.isArray(me.items)) {
+                    let present = me.items.some((item) => item && item.itemId === 'disk-io');
+                    let anchor = me.items.findIndex(
+                        (item) => item && item.itemId === guest[me.$className],
+                    );
+                    let data = me.pveSelNode.data;
+
+                    if (!present && anchor !== -1 && data.vmid) {
+                        me.items.splice(anchor + 1, 0, {
+                            xtype: 'pveGuestDiskIO',
+                            title: gettext('Disk I/O'),
+                            itemId: 'disk-io',
+                            iconCls: 'fa fa-tachometer',
+                            nodename: data.node,
+                            vmid: data.vmid,
+                            guestType: me.$className === 'PVE.lxc.Config' ? 'lxc' : 'qemu',
+                        });
+                    }
+                }
+
                 if (me.$className === 'PVE.node.Config' && Ext.isArray(me.items)) {
                     let present = me.items.some((item) => item && item.itemId === 'disk-io');
                     let anchor = me.items.findIndex((item) => item && item.itemId === 'storage');
