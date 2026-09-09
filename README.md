@@ -59,30 +59,47 @@ in `/var/lib/pve-disk-io/`.
 
 A container writing to a mergerfs pool never touches a block device itself: it
 makes a syscall, the mergerfs daemon on the host does the I/O, and so the block
-layer -- and every cgroup built on it -- credits the daemon. The panel would
-then truthfully report *"mergerfs is writing to sdh"* while hiding the only
-thing worth knowing, which is who asked it to.
+layer -- and every cgroup built on it -- credits the daemon. Left alone, the
+panel would truthfully report *"mergerfs is writing to sdh"* while hiding the
+only thing worth knowing, which is who asked it to.
 
-Ticking **Trace FUSE pool** attributes that work back to the container:
+So the daemon is treated as what it is -- a passthrough. It is **not listed as a
+consumer**; its per-disk bytes are handed to the callers holding files open on
+the pool, and it is those callers that appear, both in the consumer list and as
+a disk's **Top Consumer**:
 
-| ct | process | read | write | disks |
-| --- | --- | --- | --- | --- |
-| 3111 | Plex Transcoder | 77.6 MB/s | 8.1 MB/s | sdf |
-| 3134 | qbittorrent-nox | 3.9 MB/s | 1.3 MB/s | sdc, sdg, sdh |
+| Disk | Top Consumer |
+| --- | --- |
+| sdh | sabnzbd (3130) (97%) |
+| sdg | sabnzbd (3130) (86%) |
+| sdf | plex (3111) (100%) |
+| sdc | rebalance (rebalance-runner) (69%) |
 
-It works by matching open file descriptors on the pool's **st_dev** rather than
-on a path prefix, because a container sees the pool at its own mountpoint
-(`/storage` in one, `/mnt/storage` in another). The underlying disk comes from
-mergerfs's own `user.mergerfs.basepath` xattr, resolved through the mount table.
+Host callers count too: a rebalance script pooling media is as much a consumer
+as a container is. Rows credited this way carry a **via pool** tag.
 
-Two things to keep in mind:
+How it works:
 
-- These figures are **syscall level** (`rchar`/`wchar`), so they include what
-  the page cache absorbed and exclude readahead. They are deliberately kept out
-  of the Share column and are not summed with the block level rows.
-- It is **opt in** because finding which processes hold files open on the pool
-  costs ~500ms. That scan is cached for 30s -- a transcode or an unpack lasts
-  minutes -- so ordinary polls stay at ~50ms while tracing is on.
+- Open descriptors are matched on the pool's **st_dev**, not on a path prefix,
+  because a container sees the pool at its own mountpoint (`/storage` in one,
+  `/mnt/storage` in another). Matching on the path finds nothing.
+- The disk behind each file comes from mergerfs's own
+  `user.mergerfs.basepath` xattr, resolved through the mount table.
+- The **quantity** shared out is block level throughout; only the **split**
+  between callers comes from syscall counters (`rchar`/`wchar`, weighted by how
+  many of each caller's open files sit on that disk). So a disk's attributed
+  bytes still add up to what the disk really did.
+- I/O with no active caller -- writeback of something already finished, or a
+  process that has since exited -- would otherwise vanish and stop the numbers
+  adding up, so it is kept as a single *"no active caller"* row.
+
+The daemon that serves a pool is identified by holding `/dev/fuse` open with the
+mountpoint in its command line, so it never looks like a caller of itself.
+
+Finding which processes hold files open costs ~500ms, so that scan is cached for
+30s -- a transcode or an unpack lasts minutes. Ordinary polls stay at ~60ms.
+Untick **Trace FUSE pool** to skip it entirely, at the cost of the daemon
+reappearing as the consumer.
 
 ## How the numbers are produced
 

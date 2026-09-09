@@ -183,23 +183,24 @@ Ext.onReady(function () {
                 lxc: 'fa fa-cube',
                 qemu: 'fa fa-desktop',
                 host: 'fa fa-server',
-                fuse: 'fa fa-exchange',
             };
             let icon = icons[record.data.type] || 'fa fa-question-circle-o';
-            return '<i class="' + icon + '"></i> ' + Ext.htmlEncode(value);
+            let text = '<i class="' + icon + '"></i> ' + Ext.htmlEncode(value);
+
+            // Worth showing: these bytes were measured against the FUSE daemon
+            // and handed here, rather than charged to this consumer directly.
+            if (record.data.viaPool) {
+                text += ' <span class="pve-diskio-tag">' + gettext('via pool') + '</span>';
+            }
+            return text;
         },
 
         // Host units have no vmid; the store types the column as a number, so
         // an absent one arrives here as 0 and must not read as a real guest id.
-        // FUSE rows do have one, but their figures come from a different layer,
-        // so they are tagged to keep that visible.
         renderVmid: function (value, metaData, record) {
             if (!value) {
                 let label = record.data.type === 'host' ? gettext('host') : '-';
                 return '<span class="pve-diskio-idle">' + label + '</span>';
-            }
-            if (record.data.type === 'fuse') {
-                return value + ' <span class="pve-diskio-tag">fuse</span>';
             }
             return value;
         },
@@ -267,6 +268,11 @@ Ext.onReady(function () {
         // their row instead of flickering in and out.
         activeHostUnits: null,
 
+        // On by default: without it a FUSE pool's daemon absorbs the credit for
+        // everything its callers do, which is the opposite of what this panel
+        // is for. Can be turned off to avoid the holder scan.
+        traceFuse: true,
+
         initComponent: function () {
             let me = this;
 
@@ -309,6 +315,7 @@ Ext.onReady(function () {
                     'type',
                     'source',
                     'disks',
+                    { name: 'viaPool', type: 'boolean' },
                     { name: 'vmid', type: 'number' },
                     { name: 'readRate', type: 'number' },
                     { name: 'writeRate', type: 'number' },
@@ -440,6 +447,7 @@ Ext.onReady(function () {
                 {
                     xtype: 'checkbox',
                     boxLabel: gettext('Trace FUSE pool'),
+                    checked: true,
                     // Finding which processes hold files open on the pool costs
                     // a few hundred ms, so it is not paid unless asked for.
                     autoEl: {
@@ -811,10 +819,29 @@ Ext.onReady(function () {
                 prevGuests[g.id] = g;
             });
 
-            // --- per guest, and per (guest, disk) ---------------------------
+            let byId = {};
+            current.guests.forEach((g) => {
+                byId[g.id] = g;
+            });
+
+            // --- per consumer, and per (consumer, disk) --------------------
             let guestRows = [];
+            let rowsById = {};
             let perDisk = {}; // devno -> [{name, rate}]
             let diskGuestRate = {}; // devno -> total attributed rate
+
+            // A FUSE daemon does none of this work for itself. Its block level
+            // bytes are held back here and handed to whoever asked for them.
+            let poolRates = {}; // devno -> {read, write}
+            let poolNames = {};
+
+            let credit = function (devno, label, rate) {
+                if (rate <= 0) {
+                    return;
+                }
+                (perDisk[devno] = perDisk[devno] || []).push({ name: label, rate: rate });
+                diskGuestRate[devno] = (diskGuestRate[devno] || 0) + rate;
+            };
 
             current.guests.forEach((guest) => {
                 let before = prevGuests[guest.id];
@@ -822,25 +849,36 @@ Ext.onReady(function () {
                     return;
                 }
 
-                // Host units have no vmid, so the disk grid's "top consumer"
-                // label has to fall back to just the name.
+                if (guest.pool) {
+                    Object.keys(guest.devices || {}).forEach((devno) => {
+                        let cur = guest.devices[devno];
+                        let old = (before.devices || {})[devno];
+                        if (!old) {
+                            return;
+                        }
+                        let entry = (poolRates[devno] = poolRates[devno] || { read: 0, write: 0 });
+                        entry.read += U.rate(cur.rbytes, old.rbytes, dt);
+                        entry.write += U.rate(cur.wbytes, old.wbytes, dt);
+                    });
+                    poolNames[guest.pool] = guest.name;
+                    return;
+                }
+
+                // Host units have no vmid, so the disk grid's label falls back
+                // to just the name.
                 let label = guest.vmid ? guest.name + ' (' + guest.vmid + ')' : guest.name;
 
-                // Per-disk contribution, used both for the guest grid when a
-                // disk is selected and for the disks grid's top consumer.
                 Object.keys(guest.devices || {}).forEach((devno) => {
                     let cur = guest.devices[devno];
                     let old = (before.devices || {})[devno];
                     if (!old) {
                         return;
                     }
-                    let rate =
-                        U.rate(cur.rbytes, old.rbytes, dt) + U.rate(cur.wbytes, old.wbytes, dt);
-                    if (rate <= 0) {
-                        return;
-                    }
-                    (perDisk[devno] = perDisk[devno] || []).push({ name: label, rate: rate });
-                    diskGuestRate[devno] = (diskGuestRate[devno] || 0) + rate;
+                    credit(
+                        devno,
+                        label,
+                        U.rate(cur.rbytes, old.rbytes, dt) + U.rate(cur.wbytes, old.wbytes, dt),
+                    );
                 });
 
                 let readRate;
@@ -865,10 +903,6 @@ Ext.onReady(function () {
                     writeIops = U.rate(guest.wios, before.wios, dt);
                 }
 
-                let disks = Object.keys(guest.devices || {})
-                    .map((devno) => (prevDisks[devno] || {}).dev || devno)
-                    .sort();
-
                 // A guest belongs in the list whether or not it is busy -- it
                 // is a thing you expect to find. There are ~60 host units and
                 // most never touch a disk, so they earn their row by doing I/O
@@ -883,13 +917,18 @@ Ext.onReady(function () {
                     }
                 }
 
-                guestRows.push({
+                let disks = Object.keys(guest.devices || {})
+                    .map((devno) => (prevDisks[devno] || {}).dev || devno)
+                    .sort();
+
+                let row = {
                     id: guest.id,
                     vmid: guest.vmid,
                     name: guest.name,
                     type: guest.type,
                     source: guest.source,
                     partial: !!guest.partial,
+                    viaPool: false,
                     readRate: readRate,
                     writeRate: writeRate,
                     totalRate: readRate + writeRate,
@@ -897,64 +936,34 @@ Ext.onReady(function () {
                     writeIops: writeIops,
                     iops: readIops + writeIops,
                     share: 0,
-                    disks:
-                        disks.length > 3
-                            ? disks.slice(0, 3).join(', ') + ' +' + (disks.length - 3)
-                            : disks.join(', '),
-                });
+                    disks: disks,
+                };
+                rowsById[guest.id] = row;
+                guestRows.push(row);
             });
 
-            // Work that reached the disks through a FUSE pool. The block layer
-            // credits the FUSE daemon, so without this the panel can only say
-            // "mergerfs is writing to sdh" and never who asked it to.
-            let prevFuse = {};
-            (previous.fuse || []).forEach((f) => {
-                prevFuse[f.id] = f;
+            // --- hand the pool's bytes to whoever asked for them ------------
+            me.distributePoolIO(current, previous, dt, {
+                poolRates: poolRates,
+                poolNames: poolNames,
+                rowsById: rowsById,
+                guestRows: guestRows,
+                byId: byId,
+                prevDisks: prevDisks,
+                credit: credit,
             });
 
-            (current.fuse || []).forEach((entry) => {
-                let before = prevFuse[entry.id];
-                if (!before) {
-                    return;
-                }
-
-                let readRate = U.rate(entry.rchar, before.rchar, dt);
-                let writeRate = U.rate(entry.wchar, before.wchar, dt);
-                if (readRate + writeRate <= 0) {
-                    return;
-                }
-
-                let disks = (entry.disks || []).map((devno) => (prevDisks[devno] || {}).dev || devno);
-                if (me.selectedDisk && disks.indexOf((prevDisks[me.selectedDisk] || {}).dev) === -1) {
-                    return;
-                }
-
-                guestRows.push({
-                    id: entry.id,
-                    vmid: entry.vmid,
-                    name: entry.comm,
-                    type: 'fuse',
-                    source: 'fuse',
-                    partial: false,
-                    readRate: readRate,
-                    writeRate: writeRate,
-                    totalRate: readRate + writeRate,
-                    readIops: 0,
-                    writeIops: 0,
-                    iops: 0,
-                    share: 0,
-                    disks: disks.sort().join(', '),
-                });
-            });
-
-            // Share is a proportion of block level I/O; the FUSE rows are
-            // syscall level and would distort it, so they are left out.
-            let guestTotal = guestRows
-                .filter((row) => row.type !== 'fuse')
-                .reduce((sum, row) => sum + row.totalRate, 0);
             guestRows.forEach((row) => {
-                row.share =
-                    row.type !== 'fuse' && guestTotal > 0 ? row.totalRate / guestTotal : 0;
+                let names = (row.disks || []).slice().sort();
+                row.disks =
+                    names.length > 3
+                        ? names.slice(0, 3).join(', ') + ' +' + (names.length - 3)
+                        : names.join(', ');
+            });
+
+            let guestTotal = guestRows.reduce((sum, row) => sum + row.totalRate, 0);
+            guestRows.forEach((row) => {
+                row.share = guestTotal > 0 ? row.totalRate / guestTotal : 0;
             });
 
             // --- per disk ---------------------------------------------------
@@ -1035,6 +1044,174 @@ Ext.onReady(function () {
 
             me.pushChartSample(current.time, totals.read, totals.write);
             me.refreshSummary(totals, busiest, guestRows);
+        },
+
+        // A FUSE pool daemon does no work of its own: every byte it moves was
+        // asked for by a container or a host process. The block layer cannot
+        // see that, so the daemon's per disk bytes are shared out here among
+        // the callers holding files open on the pool, in proportion to what
+        // each of them actually read and wrote through it.
+        //
+        // The quantity handed out is block level throughout -- only the split
+        // comes from syscall counters -- so the per disk totals still add up to
+        // what the disk really did.
+        distributePoolIO: function (current, previous, dt, ctx) {
+            let me = this;
+            let U = PVE.node.DiskIOUtils;
+
+            let devnos = Object.keys(ctx.poolRates);
+            if (!devnos.length) {
+                return;
+            }
+
+            let prevFuse = {};
+            (previous.fuse || []).forEach((f) => {
+                prevFuse[f.id] = f;
+            });
+
+            let callers = [];
+            (current.fuse || []).forEach((entry) => {
+                let before = prevFuse[entry.id];
+                if (!before) {
+                    return;
+                }
+
+                let read = U.rate(entry.rchar, before.rchar, dt);
+                let write = U.rate(entry.wchar, before.wchar, dt);
+                if (read + write <= 0) {
+                    return;
+                }
+
+                let weights = entry.weights || {};
+                let totalWeight = Object.keys(weights).reduce((sum, k) => sum + weights[k], 0);
+                if (!totalWeight) {
+                    return;
+                }
+
+                callers.push({
+                    ownerId: entry.type === 'lxc' ? 'lxc:' + entry.vmid : 'host:' + entry.unit,
+                    comm: entry.comm,
+                    read: read,
+                    write: write,
+                    weights: weights,
+                    totalWeight: totalWeight,
+                });
+            });
+
+            let residual = { read: 0, write: 0, disks: {} };
+
+            let rowFor = function (caller) {
+                let row = ctx.rowsById[caller.ownerId];
+                if (row) {
+                    return row;
+                }
+
+                // The caller does no block I/O of its own, so the main pass
+                // never gave it a row -- everything it does goes via the pool.
+                let known = ctx.byId[caller.ownerId] || {};
+                row = {
+                    id: caller.ownerId,
+                    vmid: known.vmid,
+                    name: known.name || caller.comm,
+                    type: known.type || (caller.ownerId.indexOf('lxc:') === 0 ? 'lxc' : 'host'),
+                    source: 'pool',
+                    partial: false,
+                    viaPool: true,
+                    readRate: 0,
+                    writeRate: 0,
+                    totalRate: 0,
+                    readIops: 0,
+                    writeIops: 0,
+                    iops: 0,
+                    share: 0,
+                    disks: [],
+                };
+                ctx.rowsById[caller.ownerId] = row;
+                ctx.guestRows.push(row);
+                return row;
+            };
+
+            devnos.forEach((devno) => {
+                if (me.selectedDisk && devno !== me.selectedDisk) {
+                    return;
+                }
+
+                let pool = ctx.poolRates[devno];
+                if (pool.read + pool.write <= 0) {
+                    return;
+                }
+
+                let shares = callers
+                    .map((caller) => {
+                        let fraction = (caller.weights[devno] || 0) / caller.totalWeight;
+                        return {
+                            caller: caller,
+                            read: caller.read * fraction,
+                            write: caller.write * fraction,
+                        };
+                    })
+                    .filter((share) => share.read + share.write > 0);
+
+                let readWeight = shares.reduce((sum, share) => sum + share.read, 0);
+                let writeWeight = shares.reduce((sum, share) => sum + share.write, 0);
+
+                if (!shares.length || (readWeight <= 0 && writeWeight <= 0)) {
+                    // Writeback of something finished, or a caller that has
+                    // since exited. Losing it silently would make the disk's
+                    // numbers stop adding up, so it is kept as its own row.
+                    residual.read += pool.read;
+                    residual.write += pool.write;
+                    residual.disks[devno] = true;
+                    return;
+                }
+
+                let dev = (ctx.prevDisks[devno] || {}).dev || devno;
+
+                shares.forEach((share) => {
+                    let read = readWeight > 0 ? pool.read * (share.read / readWeight) : 0;
+                    let write = writeWeight > 0 ? pool.write * (share.write / writeWeight) : 0;
+                    if (read + write <= 0) {
+                        return;
+                    }
+
+                    let row = rowFor(share.caller);
+                    row.readRate += read;
+                    row.writeRate += write;
+                    row.totalRate += read + write;
+                    row.viaPool = true;
+                    if (row.disks.indexOf(dev) === -1) {
+                        row.disks.push(dev);
+                    }
+
+                    let label = row.vmid ? row.name + ' (' + row.vmid + ')' : row.name;
+                    ctx.credit(devno, label, read + write);
+                });
+            });
+
+            if (residual.read + residual.write > 500000) {
+                let poolName = Object.keys(ctx.poolNames).map((k) => ctx.poolNames[k])[0] || 'pool';
+                let disks = Object.keys(residual.disks).map(
+                    (devno) => (ctx.prevDisks[devno] || {}).dev || devno,
+                );
+
+                ctx.guestRows.push({
+                    id: 'pool:unattributed',
+                    vmid: undefined,
+                    name: Ext.String.format(gettext('{0} - no active caller'), poolName),
+                    type: 'host',
+                    source: 'pool',
+                    partial: false,
+                    viaPool: true,
+                    readRate: residual.read,
+                    writeRate: residual.write,
+                    totalRate: residual.read + residual.write,
+                    readIops: 0,
+                    writeIops: 0,
+                    iops: 0,
+                    share: 0,
+                    disks: disks,
+                });
+            }
         },
 
         // Update rows in place so the grid keeps its selection, scroll offset

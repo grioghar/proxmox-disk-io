@@ -248,7 +248,7 @@ sub _lxc_guests {
 # controller (unlike qemu.slice), so host work can be attributed per device
 # exactly the way containers are, for about 7ms.
 sub _host_consumers {
-    my ($physical) = @_;
+    my ($physical, $daemons) = @_;
 
     my $consumers = [];
 
@@ -287,6 +287,10 @@ sub _host_consumers {
             unit => $unit,
             type => 'host',
             source => 'cgroup',
+            # A FUSE daemon does no work of its own: everything it moves was
+            # asked for by someone else. Flagging it lets the panel hand its
+            # bytes to the callers instead of listing it as the consumer.
+            pool => $daemons->{$dir},
             devices => $devices,
             %$total,
         };
@@ -412,14 +416,30 @@ sub _branch_disks {
     return $branches;
 }
 
-# Which container a process belongs to, read straight from its cgroup line.
-# Walking the cgroup tree to enumerate container pids instead measured ~960ms,
-# because every entry needs a stat to tell a directory from a control file.
-sub _pid_container {
+# Who a process belongs to: a container, or a host systemd unit. Walking the
+# cgroup tree to enumerate container pids instead measured ~960ms, because
+# every entry needs a stat to tell a directory from a control file.
+sub _pid_owner {
     my ($pid) = @_;
 
     my $cgroup = PVE::DiskIO::slurp("/proc/$pid/cgroup") // return undef;
-    return $1 if $cgroup =~ m{/lxc/(\d+)};
+    chomp $cgroup;
+
+    return { type => 'lxc', vmid => $1 + 0, cgroup => "/sys/fs/cgroup/lxc/$1" }
+        if $cgroup =~ m{/lxc/(\d+)};
+
+    # Host side callers matter too: a rebalance script pooling media is as much
+    # a consumer as a container is.
+    if ($cgroup =~ m{^0::(/.*)$}) {
+        my $path = $1;
+        if ($path =~ m{^((?:/system\.slice|/user\.slice)/[^/]+)}) {
+            my $dir = "/sys/fs/cgroup$1";
+            my $unit = $1;
+            $unit =~ s{.*/}{};
+            return { type => 'host', unit => $unit, cgroup => $dir };
+        }
+    }
+
     return undef;
 }
 
@@ -435,17 +455,20 @@ sub _fuse_holders {
 
     my $pools = _fuse_pools();
     if (!scalar(keys %$pools)) {
-        $fuse_holder_cache = { updated => time(), holders => [] };
+        $fuse_holder_cache = { updated => time(), holders => [], daemons => {} };
         return [];
     }
 
     my $branches = _branch_disks($physical, $cache);
     my $holders = [];
+    my $daemons = {};
 
     for my $pid (PVE::DiskIO::listdir('/proc')) {
         next if $pid !~ /^\d+$/;
 
         my @matches;
+        my $holds_fuse_dev = 0;
+
         for my $fd (PVE::DiskIO::listdir("/proc/$pid/fd")) {
             my $path = "/proc/$pid/fd/$fd";
 
@@ -453,6 +476,14 @@ sub _fuse_holders {
             # stat and rules those out without touching the filesystem.
             my $target = readlink($path);
             next if !defined($target) || $target !~ m{^/};
+
+            # The daemon serving a pool holds /dev/fuse; its own file handles
+            # point at the branches, not at the pool, so it never looks like a
+            # caller of itself.
+            if ($target eq '/dev/fuse') {
+                $holds_fuse_dev = 1;
+                next;
+            }
             next if $target =~ m{^/(?:proc|sys|dev)/};
 
             # A container sees the pool at its own mountpoint, so match on the
@@ -461,26 +492,37 @@ sub _fuse_holders {
             next if !defined($dev) || !$pools->{$dev};
 
             push @matches, $path;
-            last if scalar(@matches) >= 16;
+            last if scalar(@matches) >= 24;
+        }
+
+        if ($holds_fuse_dev) {
+            my $cmdline = PVE::DiskIO::slurp("/proc/$pid/cmdline") // '';
+            $cmdline =~ s/\0/ /g;
+            for my $dev (keys %$pools) {
+                my $mount = $pools->{$dev}->{mount};
+                next if index($cmdline, $mount) < 0;
+                if (my $owner = _pid_owner($pid)) {
+                    $daemons->{ $owner->{cgroup} } = $mount;
+                }
+            }
         }
 
         next if !scalar(@matches);
 
-        # Only now is it worth asking who owns this process.
-        my $vmid = _pid_container($pid) or next;
+        my $owner = _pid_owner($pid) or next;
 
         push @$holders, {
             pid => $pid + 0,
-            vmid => $vmid + 0,
+            owner => $owner,
             comm => PVE::DiskIO::slurp_trim("/proc/$pid/comm") // 'unknown',
             paths => \@matches,
-            disks => [],
+            weights => {},
         };
     }
 
     _attach_branch_disks($holders, $branches, $physical);
 
-    $fuse_holder_cache = { updated => time(), holders => $holders };
+    $fuse_holder_cache = { updated => time(), holders => $holders, daemons => $daemons };
     return $holders;
 }
 
@@ -517,13 +559,16 @@ sub _attach_branch_disks {
     };
 
     for my $holder (@$holders) {
-        my %disks;
+        my $weights = {};
         for my $path (@{ $holder->{paths} }) {
             my $branch = $basepath->{$path} or next;
             my $devnos = $branches->{$branch} or next;
-            $disks{$_} = 1 for @$devnos;
+            # How many of this caller's open files sit on each disk. That is the
+            # only split available, and it is what decides how the daemon's
+            # block level bytes get shared out between callers.
+            $weights->{$_} = ($weights->{$_} // 0) + 1 for @$devnos;
         }
-        $holder->{disks} = [sort keys %disks];
+        $holder->{weights} = $weights;
         delete $holder->{paths};
     }
 }
@@ -540,12 +585,16 @@ sub _fuse_consumers {
         my ($wchar) = $io =~ /^wchar:\s+(\d+)/m;
         next if !defined($rchar) && !defined($wchar);
 
+        my $owner = $holder->{owner};
+
         push @$consumers, {
             id => "fuse:$holder->{pid}",
             pid => $holder->{pid},
-            vmid => $holder->{vmid},
             comm => $holder->{comm},
-            disks => $holder->{disks},
+            type => $owner->{type},
+            vmid => $owner->{vmid},
+            unit => $owner->{unit},
+            weights => $holder->{weights},
             rchar => ($rchar // 0) + 0,
             wchar => ($wchar // 0) + 0,
         };
@@ -1333,11 +1382,13 @@ __PACKAGE__->register_method({
         my $guests = [];
         push @$guests, @{ _lxc_guests($physical, $meta->{lxc}) };
         push @$guests, @{ _qemu_guests($meta->{qemu}) };
-        push @$guests, @{ _host_consumers($physical) };
-
-        # Off by default: the holder scan costs a few hundred ms, which is not
-        # worth paying on every poll for a node with no FUSE pool in play.
+        # Scan for FUSE callers first: it also identifies which host cgroup is
+        # the pool's daemon, which the host consumer list needs in order to flag
+        # it rather than present it as a consumer in its own right.
         my $fuse = $param->{fuse} ? (eval { _fuse_consumers($physical, $cache) } // []) : [];
+        my $daemons = $param->{fuse} ? ($fuse_holder_cache->{daemons} // {}) : {};
+
+        push @$guests, @{ _host_consumers($physical, $daemons) };
 
         return {
             time => $now,
