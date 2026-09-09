@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+
+# Samples /proc/diskstats once and writes the raw counters into one RRD per
+# physical disk, so the node Summary page can show disk I/O history the same
+# way it shows CPU, memory and network.
+#
+# Run from a systemd timer every 60s (matching the RRD step). Counters are
+# stored as DERIVE and rrdtool derives the rates, so this script keeps no
+# state: a missed run, a restart or a reboot cannot produce a bogus spike.
+
+use strict;
+use warnings;
+
+use JSON;
+use PVE::DiskIO;
+
+my $node = PVE::DiskIO::slurp_trim('/etc/hostname')
+    or die "cannot determine node name\n";
+
+my $now = time();
+my $disks = PVE::DiskIO::physical_disks();
+my $stats = PVE::DiskIO::diskstats();
+
+my $taken = {};
+my $index = [];
+my $failures = 0;
+
+for my $devno (sort keys %$disks) {
+    my $disk = $disks->{$devno};
+    my $stat = $stats->{$devno};
+
+    # A card reader with no card present reports size 0 and no counters;
+    # there is nothing to record and an RRD per empty slot is just noise.
+    next if !$stat || !$disk->{size};
+
+    my $key = PVE::DiskIO::disk_key($disk, $taken);
+    $taken->{$key} = 1;
+
+    my $values = [
+        $stat->{read_sectors} * PVE::DiskIO::SECTOR_SIZE,
+        $stat->{write_sectors} * PVE::DiskIO::SECTOR_SIZE,
+        $stat->{read_ios},
+        $stat->{write_ios},
+        $stat->{io_ticks},
+        $stat->{read_ticks},
+        $stat->{write_ticks},
+    ];
+
+    eval { PVE::DiskIO::update_rrd($node, $key, $now, $values) };
+    if (my $err = $@) {
+        warn "disk $disk->{dev} ($key): $err";
+        $failures++;
+        next;
+    }
+
+    push @$index, {
+        key => $key,
+        dev => $disk->{dev},
+        model => $disk->{model},
+        serial => $disk->{serial},
+        size => $disk->{size},
+        kind => $disk->{kind},
+        transport => $disk->{transport},
+        seen => $now,
+    };
+}
+
+# The index lets the UI label a disk, and keeps disks that are currently
+# detached listed so their history stays reachable.
+my $path = PVE::DiskIO::index_file($node);
+my $previous = [];
+if (-f $path) {
+    my $raw = PVE::DiskIO::slurp($path);
+    $previous = eval { decode_json($raw) } || [];
+}
+
+my %present = map { $_->{key} => 1 } @$index;
+for my $old (@$previous) {
+    next if $present{ $old->{key} };
+    $old->{present} = 0;
+    push @$index, $old;
+}
+$_->{present} //= 1 for @$index;
+
+my $tmp = "$path.tmp.$$";
+open(my $fh, '>', $tmp) or die "cannot write $tmp: $!\n";
+print $fh encode_json([sort { $a->{key} cmp $b->{key} } @$index]);
+close($fh);
+rename($tmp, $path) or die "cannot rename $tmp: $!\n";
+
+exit($failures ? 1 : 0);

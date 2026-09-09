@@ -3,10 +3,13 @@
 #
 # Adds two new files and makes two small, idempotent edits to stock files:
 #
-#   new   /usr/share/perl5/PVE/API2/Disks/IO.pm   the API endpoint
-#   edit  /usr/share/perl5/PVE/API2/Disks.pm      registers it as a subclass
-#   new   /usr/share/pve-manager/js/pve-disk-io.js  the panel
-#   edit  /usr/share/pve-manager/index.html.tpl     loads the panel
+#   new   /usr/share/perl5/PVE/DiskIO.pm          shared stats + RRD layout
+#   new   /usr/share/perl5/PVE/API2/Disks/IO.pm   the API endpoints
+#   edit  /usr/share/perl5/PVE/API2/Disks.pm      registers them as a subclass
+#   new   /usr/local/sbin/pve-disk-io-collector   records history once a minute
+#   new   /etc/systemd/system/pve-disk-io-collector.{service,timer}
+#   new   /usr/share/pve-manager/js/pve-disk-io.js  the panel and summary graph
+#   edit  /usr/share/pve-manager/index.html.tpl     loads them
 #
 # pvemanagerlib.js is deliberately NOT touched: the panel installs itself into
 # the node menu with a runtime Ext override, so a pve-manager upgrade can never
@@ -19,7 +22,10 @@ set -euo pipefail
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="/root/config-backups/disk-io"
 
+SHARED_MODULE="/usr/share/perl5/PVE/DiskIO.pm"
 API_MODULE="/usr/share/perl5/PVE/API2/Disks/IO.pm"
+COLLECTOR="/usr/local/sbin/pve-disk-io-collector"
+UNIT_DIR="/etc/systemd/system"
 DISKS_PM="/usr/share/perl5/PVE/API2/Disks.pm"
 PANEL_JS="/usr/share/pve-manager/js/pve-disk-io.js"
 INDEX_TPL="/usr/share/pve-manager/index.html.tpl"
@@ -38,7 +44,8 @@ done
 
 mkdir -p "$BACKUP_DIR"
 
-echo "==> installing API module"
+echo "==> installing modules"
+install -m 0644 "$SRC_DIR/perl/DiskIO.pm" "$SHARED_MODULE"
 install -m 0644 "$SRC_DIR/perl/IO.pm" "$API_MODULE"
 
 echo "==> registering /nodes/{node}/disks/io"
@@ -73,14 +80,28 @@ if ! grep -q 'pve-disk-io\.js' "$INDEX_TPL"; then
     exit 1
 fi
 
+echo "==> installing the history collector"
+install -m 0755 "$SRC_DIR/bin/pve-disk-io-collector" "$COLLECTOR"
+install -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.service" "$UNIT_DIR/"
+install -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.timer" "$UNIT_DIR/"
+
 # Never restart the API into code that does not compile.
 echo "==> checking syntax"
+perl -I/usr/share/perl5 -c "$SHARED_MODULE"
 perl -I/usr/share/perl5 -c "$API_MODULE"
 perl -I/usr/share/perl5 -c "$DISKS_PM"
+
+echo "==> starting the collector"
+systemctl daemon-reload
+systemctl enable --now pve-disk-io-collector.timer
+# Seed one sample immediately so the RRDs exist before the first timer tick.
+systemctl start pve-disk-io-collector.service || true
 
 echo "==> restarting pvedaemon and pveproxy"
 systemctl restart pvedaemon pveproxy
 
 echo
-echo "Installed. Open a node in the web UI: Disks -> I/O Activity."
+echo "Installed."
+echo "  live view : Node -> Disks -> I/O Activity"
+echo "  history   : Node -> Summary (fills in over the next few minutes)"
 echo "Hard-reload the browser (Ctrl-Shift-R) to pick up the new script."

@@ -1,0 +1,14 @@
+[Unit]
+Description=Sample physical disk I/O every minute
+Documentation=file:/root/proxmox-disk-io/README.md
+
+[Timer]
+# Must match PVE::DiskIO::RRD_STEP (60s). AccuracySec keeps samples close to
+# the RRD step boundary so rrdtool does not have to interpolate every point.
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

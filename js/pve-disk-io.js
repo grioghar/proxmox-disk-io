@@ -1043,6 +1043,262 @@ Ext.onReady(function () {
         },
     });
 
+    // ------------------------------------------------ summary history chart
+
+    // Distinguishable in both themes and stable across reloads: series colours
+    // are assigned by the disk's position in the (sorted) index, so a given
+    // disk keeps its colour.
+    const DISK_PALETTE = [
+        '#115fa6',
+        '#94ae0a',
+        '#a61120',
+        '#ff8809',
+        '#7c4b96',
+        '#22b2b2',
+        '#c14b9e',
+        '#5f9c3a',
+        '#e6650d',
+        '#4d7fbf',
+        '#b8a90d',
+        '#8c5a2b',
+    ];
+
+    // The stock RRD store builds its URL as "<rrdurl>?timeframe=..&cf=..".
+    // Carrying which disk to plot means extending that, but everything else --
+    // including following the page's Hour/Day/Week/Month/Year selector -- is
+    // inherited unchanged.
+    Ext.define('PVE.data.DiskIORRDStore', {
+        extend: 'Proxmox.data.RRDStore',
+
+        diskKey: 'all',
+
+        setRRDUrl: function (timeframe, cf) {
+            let me = this;
+            me.callParent([timeframe, cf]);
+            me.proxy.url += '&disk=' + encodeURIComponent(me.diskKey);
+        },
+    });
+
+    Ext.define('PVE.node.DiskIOSummaryChart', {
+        extend: 'Ext.panel.Panel',
+        alias: 'widget.pveNodeDiskIOSummaryChart',
+
+        layout: 'fit',
+        border: false,
+        header: false,
+
+        // Which disk is plotted: 'all' overlays every disk, otherwise the key
+        // of a single disk from the rrdlist endpoint.
+        selected: 'all',
+
+        initComponent: function () {
+            let me = this;
+
+            let nodename = me.nodename || me.pveSelNode?.data?.node;
+            if (!nodename) {
+                throw 'no node name specified';
+            }
+            me.nodename = nodename;
+
+            me.callParent();
+
+            me.loadDisks();
+        },
+
+        loadDisks: function () {
+            let me = this;
+
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.nodename + '/disks/io/rrdlist',
+                method: 'GET',
+                success: function (response) {
+                    if (me.isDestroyed) {
+                        return;
+                    }
+                    me.disks = response.result.data || [];
+                    me.buildChart();
+                },
+                failure: function (response) {
+                    if (me.isDestroyed) {
+                        return;
+                    }
+                    Proxmox.Utils.setErrorMask(me, response.htmlStatus);
+                },
+            });
+        },
+
+        buildChart: function () {
+            let me = this;
+
+            me.removeAll(true);
+            if (me.rrdstore) {
+                me.rrdstore.stopUpdate();
+                me.rrdstore.destroy();
+            }
+
+            let disks = me.disks || [];
+            let single = me.selected !== 'all' ? disks.find((d) => d.key === me.selected) : null;
+
+            // 'all' plots one series per disk (total throughput, so each disk
+            // is a single readable line); a specific disk splits into read and
+            // write, which is the interesting question once you have picked one.
+            let fields;
+            let fieldTitles;
+            let colors;
+            let seriesConfig;
+
+            if (single) {
+                fields = ['read', 'write'];
+                fieldTitles = [gettext('Read'), gettext('Write')];
+                colors = ['#115fa6', '#94ae0a'];
+            } else {
+                let usable = disks.filter((d) => d.dev);
+                fields = usable.map((d) => d.dev);
+                fieldTitles = usable.map((d) => d.dev + (d.present ? '' : ' (' + gettext('detached') + ')'));
+                colors = usable.map((d, i) => DISK_PALETTE[i % DISK_PALETTE.length]);
+
+                // RRDChart fills its series by default, which reads well for
+                // two series but turns nine overlaid disks into a muddy stack
+                // where no single disk can be followed. Plain lines instead.
+                seriesConfig = {
+                    fill: false,
+                    style: { lineWidth: 1.5, opacity: 1 },
+                };
+            }
+
+            if (!fields.length) {
+                me.add({
+                    xtype: 'component',
+                    padding: 20,
+                    html: Ext.htmlEncode(
+                        gettext('No disk I/O history recorded yet.'),
+                    ),
+                });
+                return;
+            }
+
+            me.rrdstore = Ext.create('PVE.data.DiskIORRDStore', {
+                rrdurl: '/api2/json/nodes/' + me.nodename + '/disks/io/rrddata',
+                diskKey: me.selected,
+                // Same time handling as PVE's own RRD models: the API returns
+                // epoch seconds and Ext converts them to a Date for the axis.
+                fields: [{ name: 'time', type: 'date', dateFormat: 'timestamp' }].concat(
+                    fields,
+                ),
+            });
+
+            let title = single
+                ? Ext.String.format(gettext('Disk I/O - {0}'), single.dev || single.key)
+                : gettext('Disk I/O');
+
+            let chart = Ext.create('Proxmox.widget.RRDChart', {
+                title: title,
+                store: me.rrdstore,
+                fields: fields,
+                fieldTitles: fieldTitles,
+                colors: colors,
+                unit: 'bytespersecond',
+                seriesConfig: seriesConfig,
+                border: false,
+            });
+
+            // Put the disk picker in the chart's own header, beside the title
+            // and legend, so the whole thing reads as one window rather than a
+            // chart with a toolbar bolted on top.
+            let header = chart.getHeader();
+            if (header) {
+                header.insert(1, me.buildPicker());
+            }
+
+            me.add(chart);
+            me.rrdstore.startUpdate();
+        },
+
+        buildPicker: function () {
+            let me = this;
+
+            let rows = [{ key: 'all', label: gettext('All disks') }];
+            for (const disk of me.disks || []) {
+                let label = disk.dev || disk.key;
+                if (disk.model) {
+                    label += ' - ' + disk.model;
+                }
+                if (!disk.present) {
+                    label += ' (' + gettext('detached') + ')';
+                }
+                rows.push({ key: disk.key, label: label });
+            }
+
+            return {
+                xtype: 'combobox',
+                margin: '0 8 0 8',
+                width: 260,
+                editable: false,
+                queryMode: 'local',
+                displayField: 'label',
+                valueField: 'key',
+                value: me.selected,
+                store: { fields: ['key', 'label'], data: rows },
+                listeners: {
+                    change: function (field, value) {
+                        if (value === me.selected) {
+                            return;
+                        }
+                        me.selected = value;
+
+                        // Rebuilding replaces the chart, and this combobox
+                        // lives in that chart's header -- so it must not happen
+                        // while ExtJS is still inside the combobox's own change
+                        // handling, or it carries on against a destroyed field.
+                        Ext.defer(function () {
+                            if (!me.isDestroyed) {
+                                me.buildChart();
+                            }
+                        }, 1);
+                    },
+                },
+            };
+        },
+
+        doDestroy: function () {
+            let me = this;
+            if (me.rrdstore) {
+                me.rrdstore.stopUpdate();
+                me.rrdstore.destroy();
+                me.rrdstore = undefined;
+            }
+            me.callParent();
+        },
+    });
+
+    // The node Summary builds its graphs into a single column container. Adding
+    // to that after it exists puts the disk I/O history alongside the CPU,
+    // memory and network graphs, picking up the same column width, height and
+    // padding defaults.
+    Ext.define('PVE.node.DiskIOSummaryInjection', {
+        override: 'PVE.node.Summary',
+
+        initComponent: function () {
+            let me = this;
+
+            me.callParent();
+
+            try {
+                let container = me.down('#itemcontainer');
+                if (container && !container.down('pveNodeDiskIOSummaryChart')) {
+                    container.add({
+                        xtype: 'pveNodeDiskIOSummaryChart',
+                        nodename: me.pveSelNode.data.node,
+                    });
+                }
+            } catch (err) {
+                if (window.console && window.console.error) {
+                    window.console.error('pve-disk-io: could not add summary chart', err);
+                }
+            }
+        },
+    });
+
     // ------------------------------------------------- menu entry injection
 
     // PVE.node.Config builds its item list and then hands it to

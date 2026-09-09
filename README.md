@@ -18,6 +18,43 @@ disk alone, so "what is hammering `sdc`?" is one click.
 **Throughput chart** — aggregate read/write over a rolling window, drawn with
 Proxmox's own `RRDChart` widget so it matches the rest of the UI.
 
+## History on the node Summary
+
+The node Summary page gets a **Disk I/O** graph beside the CPU, memory and
+network ones. It follows the page's existing Hour/Day/Week/Month/Year selector,
+because it is built on the same `Proxmox.data.RRDStore` those graphs use.
+
+By default it overlays every physical disk, one line each, so a spike is
+immediately attributable to a spindle. A picker in the graph's header narrows
+it to a single disk, which then splits into read and write.
+
+PVE records `diskread`/`diskwrite` per *guest* already (that is the Disk IO
+graph on each guest's own Summary), but a node's RRD has no disk fields at all
+— only cpu, memory, network, root filesystem and pressure. So this adds its own.
+
+- **Storage** — one RRD per disk under `/var/lib/pve-disk-io/rrd/<node>/`,
+  with the same step and retention as PVE's node RRDs (60s, and RRAs at 1min /
+  30min / 6h / 7d with AVERAGE and MAX), so the timeframe selector behaves
+  identically.
+
+- **Keyed on serial, not `sdX`.** Kernel names are not stable — USB enclosures
+  in particular reorder across reboots — so history keyed on `sdb` would
+  silently follow whichever drive enumerated second. Keying on the serial means
+  a disk's history follows the physical drive. A disk that is currently
+  detached stays listed (greyed as *detached*) so its history is still
+  reachable.
+
+- **Counters, not rates.** The collector writes raw counters into `DERIVE` data
+  sources and lets rrdtool derive the rates, so it holds no state: a missed
+  run, a restart or a reboot cannot produce a bogus spike.
+
+- **Collection** — `pve-disk-io-collector.timer` runs once a minute, matching
+  the RRD step. The collector reads only procfs and sysfs, so it needs neither
+  the PVE API stack nor a long-running daemon.
+
+Uninstalling stops the collector but deliberately leaves the recorded history
+in `/var/lib/pve-disk-io/`.
+
 ## How the numbers are produced
 
 The API returns raw monotonic counters plus a high-resolution timestamp; the
@@ -67,8 +104,11 @@ backs the stock files up to `/root/config-backups/disk-io/`.
 
 | | |
 | --- | --- |
-| new | `/usr/share/perl5/PVE/API2/Disks/IO.pm` |
+| new | `/usr/share/perl5/PVE/DiskIO.pm` — shared stats and RRD layout |
+| new | `/usr/share/perl5/PVE/API2/Disks/IO.pm` — the API endpoints |
 | edit | `/usr/share/perl5/PVE/API2/Disks.pm` — registers the subclass |
+| new | `/usr/local/sbin/pve-disk-io-collector` |
+| new | `/etc/systemd/system/pve-disk-io-collector.{service,timer}` |
 | new | `/usr/share/pve-manager/js/pve-disk-io.js` |
 | edit | `/usr/share/pve-manager/index.html.tpl` — loads the panel |
 
@@ -101,6 +141,14 @@ Two ExtJS traps cost real debugging time here, both worth knowing:
   `Ext.Component.render()`, so the layout calls your function with its own
   arguments. The same applies to `update*` and `apply*`, which are the config
   system's updater/applier naming convention.
+
+- **Do not destroy a component from inside its own event handler.** The disk
+  picker lives in the chart header it replaces, so rebuilding straight from its
+  `change` handler left ExtJS running against a destroyed field. Defer it.
+
+- `Proxmox.data.UpdateStore.startUpdate()` will not load until
+  `Proxmox.Utils.authOK()` is true, which is worth knowing when a store looks
+  stuck at zero records in a test harness.
 
 There is a browser harness under `docs/harness.md` for testing changes against
 the real ExtJS and `pvemanagerlib.js` offline, without touching a live node.
