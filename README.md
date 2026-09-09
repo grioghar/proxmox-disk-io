@@ -135,9 +135,23 @@ algorithm as `distributePoolIO()` in the panel. The panel computes rates in the
 browser so the API can stay stateless, and the collector cannot reuse that, so
 both carry a note that they must be kept in step.
 
+A disk a guest reaches **through a storage pool** is marked *(via pool)* in the
+legend, because that series is apportioned from the pool daemon's totals rather
+than measured against the guest -- the same distinction the live panel draws
+with its `via pool` tag. A guest's own block I/O carries no marker. For plex,
+for instance, the media disks are marked and its rootfs on nvme0n1 is not.
+
 Host consumers are deliberately not recorded here -- this is guest history and
 the charts are keyed on vmid -- so a host script like a rebalance job shows up
 in the live panel but not in guest history.
+
+**On the legend's position.** The series are drawn exactly as PVE draws its own,
+filled and in the same style. The legend, though, is docked under the chart
+rather than sitting in the header where PVE puts its. That is deliberate: no
+stock PVE graph has more than three series, while these carry one per disk or
+per guest. In the header such a legend either crushes the title out of
+existence (measured: 825px of a 1158px header, leaving the title 67px) or, once
+wrapped, overlaps the plot.
 
 ## How the numbers are produced
 

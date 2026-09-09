@@ -454,6 +454,11 @@ sub attribute_io {
 
             $out->{ $caller->{id} }->{$devno}->{read} += $read;
             $out->{ $caller->{id} }->{$devno}->{write} += $write;
+
+            # Worth carrying: these bytes were measured against the pool's
+            # daemon and apportioned, so the split between simultaneous callers
+            # is inference rather than measurement.
+            $out->{ $caller->{id} }->{$devno}->{pool} = 1;
         }
     }
 

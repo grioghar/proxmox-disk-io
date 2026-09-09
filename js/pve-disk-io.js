@@ -91,6 +91,7 @@ Ext.onReady(function () {
     opacity: 0.85;
 }
 .pve-diskio-idle { opacity: 0.45; }
+
 `;
         document.head.appendChild(style);
     }
@@ -1543,6 +1544,7 @@ Ext.onReady(function () {
 
         // A chart already scoped to one guest has nothing to pick between.
         showPicker: true,
+        pickerWidth: 240,
 
         // Extra query parameters for the data endpoint, for subclasses whose
         // series depend on more than the timeframe.
@@ -1656,6 +1658,7 @@ Ext.onReady(function () {
             });
 
             let chart = Ext.create('Proxmox.widget.RRDChart', {
+                cls: 'pve-diskio-chart',
                 title: spec.title,
                 store: me.rrdstore,
                 fields: spec.fields,
@@ -1675,13 +1678,13 @@ Ext.onReady(function () {
                     header.insert(1, me.buildPicker());
                 }
 
-                // RRDChart parks its legend in the panel header. That is fine
-                // for two series, but with one entry per disk or per guest it
-                // measured 825px of a 1158px header and squeezed the title down
-                // to 67px, so both graphs arrived on the Summary page with no
-                // readable name. Constraining the title only moves the problem
-                // to the legend, so the legend is docked under the chart
-                // instead, where it has the full width to wrap into.
+                // RRDChart parks its legend in the panel header, where PVE's
+                // own graphs have theirs. That works because no stock graph has
+                // more than three series; these carry one per disk or per
+                // guest. In the header such a legend either crushes the title
+                // out of existence or, once wrapped, overlaps the plot, so it
+                // is docked under the chart where it has room. The series
+                // themselves are drawn exactly as PVE draws its own.
                 let legend = header.down('legend');
                 if (legend) {
                     header.remove(legend, false);
@@ -1810,7 +1813,6 @@ Ext.onReady(function () {
                 // RRDChart fills its series by default, which reads well for
                 // two series but turns nine overlaid disks into a muddy stack
                 // where no single one can be followed. Plain lines instead.
-                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
             };
         },
     });
@@ -1914,10 +1916,11 @@ Ext.onReady(function () {
                 return {
                     title: Ext.String.format(gettext('Guest Disk I/O - {0}'), label),
                     fields: entries.map((d) => d.dev),
-                    fieldTitles: entries.map((d) => d.dev),
+                    fieldTitles: entries.map((d) =>
+                        d.via_pool ? d.dev + ' ' + gettext('(via pool)') : d.dev,
+                    ),
                     colors: entries.map((d, i) => SERIES_PALETTE[i % SERIES_PALETTE.length]),
-                    seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
-                };
+                    };
             }
 
             // The ranked head of the list is what the data endpoint returns as
@@ -1934,7 +1937,6 @@ Ext.onReady(function () {
                 colors: ranked.map((g, i) =>
                     g.type === 'other' ? OTHER_COLOR : SERIES_PALETTE[i % SERIES_PALETTE.length],
                 ),
-                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
             };
         },
     });
@@ -2020,9 +2022,14 @@ Ext.onReady(function () {
             return {
                 title: gettext('Disk I/O by Disk'),
                 fields: entries.map((d) => d.dev),
-                fieldTitles: entries.map((d) => d.dev),
+                // A disk reached through a storage pool is marked, because that
+                // series is apportioned from the pool daemon's totals rather
+                // than measured against this guest -- the same distinction the
+                // live panel draws with its "via pool" tag.
+                fieldTitles: entries.map((d) =>
+                    d.via_pool ? d.dev + ' ' + gettext('(via pool)') : d.dev,
+                ),
                 colors: entries.map((d, i) => SERIES_PALETTE[i % SERIES_PALETTE.length]),
-                seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
             };
         },
     });

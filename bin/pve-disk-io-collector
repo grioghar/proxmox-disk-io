@@ -125,6 +125,7 @@ if ($last) {
     # the interval is skipped and only the state is refreshed.
     if ($dt >= 30 && $dt <= 180) {
         my $attributed = PVE::DiskIO::attribute_io($last, $sample);
+        my $via_pool = {};
 
         for my $owner (keys %$attributed) {
             # Host units are consumers too, but this is guest history and the
@@ -135,6 +136,7 @@ if ($last) {
             for my $devno (keys %{ $attributed->{$owner} }) {
                 my $key = $disk_keys->{$devno} or next;
                 my $io = $attributed->{$owner}->{$devno};
+                $via_pool->{"$vmid/$key"} = $io->{pool} ? 1 : 0;
 
                 eval {
                     PVE::DiskIO::update_guest_rrd(
@@ -146,6 +148,24 @@ if ($last) {
                     warn "guest $vmid disk $key: $err";
                     $failures++;
                 }
+            }
+        }
+        # So the history charts can say which series are apportioned rather
+        # than measured, the way the live panel's "via pool" tag does.
+        if (scalar(keys %$via_pool)) {
+            my $flags_path = "$PVE::DiskIO::RRD_BASE/$node.guestflags.json";
+            my $existing = {};
+            if (-f $flags_path) {
+                my $raw = PVE::DiskIO::slurp($flags_path);
+                $existing = eval { decode_json($raw) } || {};
+            }
+            $existing->{$_} = $via_pool->{$_} for keys %$via_pool;
+
+            my $ftmp = "$flags_path.tmp.$$";
+            if (open(my $ffh, '>', $ftmp)) {
+                print $ffh encode_json($existing);
+                close($ffh);
+                rename($ftmp, $flags_path);
             }
         }
     }

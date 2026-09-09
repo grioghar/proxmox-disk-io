@@ -975,6 +975,11 @@ sub _guest_disk_totals {
     my $index = defined($raw) ? (eval { decode_json($raw) } || []) : [];
     my $names = { map { $_->{key} => $_->{dev} } @$index };
 
+    # Which of this guest's disks it reaches through a storage pool, so the
+    # chart can say which series are apportioned rather than measured.
+    my $flags_raw = PVE::DiskIO::slurp("$PVE::DiskIO::RRD_BASE/$node.guestflags.json");
+    my $flags = defined($flags_raw) ? (eval { decode_json($flags_raw) } || {}) : {};
+
     my $out = [];
     for my $entry (PVE::DiskIO::listdir($dir)) {
         next if $entry !~ /^(.+)\.rrd$/;
@@ -997,6 +1002,7 @@ sub _guest_disk_totals {
             dev => $names->{$key} // $key,
             total => $total,
             points => $points,
+            via_pool => $flags->{"$vmid/$key"} ? 1 : 0,
         };
     }
 
@@ -1040,7 +1046,10 @@ __PACKAGE__->register_method({
             $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
         );
 
-        return [map { { key => $_->{key}, dev => $_->{dev}, total => $_->{total} } } @$disks];
+        return [
+            map { { key => $_->{key}, dev => $_->{dev}, total => $_->{total},
+                    via_pool => $_->{via_pool} } } @$disks
+        ];
     },
 });
 
