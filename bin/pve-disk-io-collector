@@ -127,27 +127,43 @@ if ($last) {
         my $attributed = PVE::DiskIO::attribute_io($last, $sample);
         my $via_pool = {};
 
+        # Host units are recorded alongside guests: a rebalance job moving
+        # media is as much a consumer of a disk as any container.
         for my $owner (keys %$attributed) {
-            # Host units are consumers too, but this is guest history and the
-            # chart is keyed on vmid; they stay in the live panel only.
-            next if $owner !~ /^(?:lxc|qemu):(\d+)$/;
-            my $vmid = $1;
+            next if $owner !~ /^(?:lxc|qemu|host):/;
 
             for my $devno (keys %{ $attributed->{$owner} }) {
                 my $key = $disk_keys->{$devno} or next;
                 my $io = $attributed->{$owner}->{$devno};
-                $via_pool->{"$vmid/$key"} = $io->{pool} ? 1 : 0;
+                $via_pool->{"$owner/$key"} = $io->{pool} ? 1 : 0;
 
                 eval {
-                    PVE::DiskIO::update_guest_rrd(
-                        $node, $vmid, $key, $sample->{time},
+                    PVE::DiskIO::update_consumer_rrd(
+                        $node, $owner, $key, $sample->{time},
                         $io->{read} // 0, $io->{write} // 0,
                     );
                 };
                 if (my $err = $@) {
-                    warn "guest $vmid disk $key: $err";
+                    warn "consumer $owner disk $key: $err";
                     $failures++;
                 }
+            }
+        }
+
+        # What to call each consumer, so the query side does not have to reload
+        # every guest config to label a chart.
+        my $names = {};
+        for my $guest (@{ $sample->{guests} }) {
+            next if $guest->{pool};
+            $names->{ $guest->{id} } = $guest->{name} if $guest->{id} && $guest->{name};
+        }
+        if (scalar(keys %$names)) {
+            my $npath = PVE::DiskIO::consumers_file($node);
+            my $ntmp = "$npath.tmp.$$";
+            if (open(my $nfh, '>', $ntmp)) {
+                print $nfh encode_json($names);
+                close($nfh);
+                rename($ntmp, $npath);
             }
         }
         # So the history charts can say which series are apportioned rather

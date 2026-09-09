@@ -141,9 +141,18 @@ than measured against the guest -- the same distinction the live panel draws
 with its `via pool` tag. A guest's own block I/O carries no marker. For plex,
 for instance, the media disks are marked and its rootfs on nvme0n1 is not.
 
-Host consumers are deliberately not recorded here -- this is guest history and
-the charts are keyed on vmid -- so a host script like a rebalance job shows up
-in the live panel but not in guest history.
+Host units are recorded alongside guests, so a rebalance job pooling media
+appears in history the same way a container does, and can be selected to see
+which disks it moved between.
+
+The node's **Disk I/O by Consumer** graph is drawn from these RRDs rather than
+from PVE's per-guest ones. That is not only so host units can appear: PVE's
+guest RRDs record what a guest's own cgroup did, which **excludes** everything
+it does through a storage pool. On a media host that is most of its I/O, so the
+stock figures understate exactly the guests worth watching. The cost of using
+its own data is depth -- this history starts when the collector was installed,
+where PVE's goes back as far as the node does. Each guest's own PVE Summary
+graph still holds that longer record of its totals.
 
 **On the legend's position.** The series are drawn exactly as PVE draws its own,
 filled and in the same style. The legend, though, is docked under the chart

@@ -785,137 +785,78 @@ my $GUEST_HISTORY_TTL = {
 
 my $guest_history_cache = {};
 
-my $GUEST_LIST_TTL = 120;
-my $guest_list_cache = { updated => 0, list => undef };
+my $CONSUMER_LIST_TTL = 120;
+my $consumer_list_cache = { updated => 0, list => undef };
 
-sub _node_guest_list {
+# Display names, written once a minute by the collector, so labelling a chart
+# does not mean reloading every guest config from pmxcfs on each request.
+sub _consumer_names {
+    my ($node) = @_;
+    my $raw = PVE::DiskIO::slurp(PVE::DiskIO::consumers_file($node));
+    return defined($raw) ? (eval { decode_json($raw) } || {}) : {};
+}
+
+# Directory names are sanitised, so map back from what is on disk to the
+# consumer id the collector used.
+sub _consumer_dirs {
     my ($node) = @_;
 
-    # 51 config reads off pmxcfs measured ~1s, which dwarfed everything else
-    # this endpoint does. Names and the guest roster change rarely.
-    if ($guest_list_cache->{list} && (time() - $guest_list_cache->{updated}) < $GUEST_LIST_TTL) {
-        return $guest_list_cache->{list};
+    if ($consumer_list_cache->{list}
+        && (time() - $consumer_list_cache->{updated}) < $CONSUMER_LIST_TTL) {
+        return $consumer_list_cache->{list};
     }
 
-    # /etc/pve/lxc and /etc/pve/qemu-server are pmxcfs's view of *this* node's
-    # guests, and the endpoint is proxyto => 'node', so it always runs where
-    # they are correct. Reading them directly avoids PVE::Cluster::get_vmlist,
-    # which needs a cfs_update() first and silently returns nothing without it.
-    my $guests = [];
+    my $names = _consumer_names($node);
+    my $root = PVE::DiskIO::rrd_dir($node);
+    my $found = [];
 
-    for my $conf (glob('/etc/pve/lxc/*.conf')) {
-        next if $conf !~ m{/(\d+)\.conf$};
-        my $vmid = $1;
-        my $name = eval { require PVE::LXC::Config; PVE::LXC::Config->load_config($vmid)->{hostname} };
-        push @$guests, { vmid => $vmid + 0, type => 'lxc', name => $name // "$vmid" };
+    for my $vmid (PVE::DiskIO::listdir("$root/guests")) {
+        next if $vmid !~ /^\d+$/;
+        my $id = (grep { $_ eq "lxc:$vmid" || $_ eq "qemu:$vmid" } keys %$names)[0]
+            // "lxc:$vmid";
+        push @$found, {
+            id => $id,
+            vmid => $vmid + 0,
+            kind => 'guest',
+            dir => "$root/guests/$vmid",
+            name => $names->{$id} // $vmid,
+        };
     }
 
-    for my $conf (glob('/etc/pve/qemu-server/*.conf')) {
-        next if $conf !~ m{/(\d+)\.conf$};
-        my $vmid = $1;
-        my $conf_data = eval { require PVE::QemuConfig; PVE::QemuConfig->load_config($vmid) };
-        # Templates never run, so they have no history worth plotting.
-        next if $conf_data && $conf_data->{template};
-        push @$guests, { vmid => $vmid + 0, type => 'qemu', name => $conf_data->{name} // "$vmid" };
+    my $host_by_dir = {};
+    for my $id (keys %$names) {
+        next if $id !~ /^host:(.+)$/;
+        my $unit = $1;
+        $unit =~ s/[^A-Za-z0-9_.@-]/_/g;
+        $host_by_dir->{$unit} = $id;
     }
 
-    my $sorted = [sort { $a->{vmid} <=> $b->{vmid} } @$guests];
-    $guest_list_cache = { updated => time(), list => $sorted };
+    for my $unit (PVE::DiskIO::listdir("$root/hosts")) {
+        my $id = $host_by_dir->{$unit} // "host:$unit";
+        push @$found, {
+            id => $id,
+            kind => 'host',
+            dir => "$root/hosts/$unit",
+            name => $names->{$id} // $unit,
+        };
+    }
 
-    return $sorted;
+    $consumer_list_cache = { updated => time(), list => $found };
+    return $found;
 }
 
-# PVE's own reader builds a hash of all ~17 data sources for every row. Across
-# 50 guests at day resolution that is 70k hashes and measured ~2.1s; only two
-# columns are wanted here, so read them directly. Resolutions match
-# PVE::RRD::create_rrd_data exactly so this graph lines up with the guest's own.
-my $GUEST_RRD_SETUP = {
-    hour => [60, 60],
-    day => [60, 1440],
-    week => [1800, 336],
-    month => [1800, 1440],
-    year => [21600, 1440],
-};
-
-sub _guest_disk_series {
-    my ($vmid, $timeframe, $cf) = @_;
-
-    my $spec = $GUEST_RRD_SETUP->{$timeframe} or return undef;
-    my ($resolution, $count) = @$spec;
-
-    my $file = "/var/lib/rrdcached/db/pve-vm-9.0/$vmid";
-    return undef if !-f $file;
-
-    # A node upgraded from PVE 8 can still hold part of the window in the old
-    # pve2 files. Stitching those together is fiddly, and PVE already does it,
-    # so hand those cases back to PVE's reader rather than quietly losing data.
-    if (-e "/var/lib/rrdcached/db/pve2-vm/$vmid" || -e "/var/lib/rrdcached/db/pve2-vm/$vmid.old") {
-        require PVE::RRD;
-        my $rows = eval { PVE::RRD::create_rrd_data("pve-vm-9.0/$vmid", $timeframe, $cf) } or return undef;
-
-        my $points = {};
-        my $total = 0;
-        for my $row (@$rows) {
-            my $t = $row->{time} or next;
-            next if !defined($row->{diskread}) && !defined($row->{diskwrite});
-            my $sum = ($row->{diskread} // 0) + ($row->{diskwrite} // 0);
-            $points->{ $t + 0 } = { read => $row->{diskread}, write => $row->{diskwrite}, total => $sum };
-            $total += $sum;
-        }
-        return { points => $points, total => $total };
-    }
-
-    my $ctime = $resolution * int(time() / $resolution);
-    my @args = (
-        '-s' => $ctime - $resolution * $count,
-        '-e' => $ctime - 1,
-        '-r' => $resolution,
-    );
-
-    # Same as PVE: go through rrdcached so the newest samples are flushed.
-    my $socket = '/var/run/rrdcached.sock';
-    push @args, '--daemon' => "unix:$socket" if -S $socket;
-
-    require RRDs;
-    my ($start, $step, $names, $data) = RRDs::fetch($file, $cf, @args);
-    return undef if RRDs::error() || !$data || !$names;
-
-    my ($read_idx, $write_idx);
-    for my $i (0 .. $#$names) {
-        $read_idx = $i if $names->[$i] eq 'diskread';
-        $write_idx = $i if $names->[$i] eq 'diskwrite';
-    }
-    return undef if !defined($read_idx) && !defined($write_idx);
-
-    my $points = {};
-    my $total = 0;
-    my $t = $start;
-
-    for my $row (@$data) {
-        my $read = defined($read_idx) ? $row->[$read_idx] : undef;
-        my $write = defined($write_idx) ? $row->[$write_idx] : undef;
-
-        if (defined($read) || defined($write)) {
-            my $sum = ($read // 0) + ($write // 0);
-            $points->{$t} = { read => $read, write => $write, total => $sum };
-            $total += $sum;
-        }
-        $t += $step;
-    }
-
-    return { points => $points, total => $total };
+sub _consumer_field {
+    my ($consumer) = @_;
+    return $consumer->{kind} eq 'guest'
+        ? "$consumer->{name} ($consumer->{vmid})"
+        : $consumer->{name};
 }
 
-# Field names double as the chart's series titles, so they are the label the
-# user should read rather than an opaque id.
-sub _guest_field {
-    my ($guest) = @_;
-    return "$guest->{name} ($guest->{vmid})";
-}
-
-# Reading ~50 RRDs is too expensive to repeat for every poll of a store that
-# refreshes every 30s, and the underlying data only moves once a minute.
-sub _guest_history {
+# History for every consumer on the node, summed across the disks each touched.
+# Read from this module's own RRDs rather than PVE's per-guest ones: those cover
+# guests only, and they exclude I/O a guest does through a storage pool, which
+# on a media host is most of it.
+sub _consumer_history {
     my ($node, $timeframe, $cf) = @_;
 
     my $key = join('/', $node, $timeframe, $cf);
@@ -923,53 +864,88 @@ sub _guest_history {
     my $cached = $guest_history_cache->{$key};
     return $cached->{data} if $cached && (time() - $cached->{updated}) < $ttl;
 
-    my $guests = _node_guest_list($node);
+    my $consumers = [];
     my $series = {};
     my $totals = {};
+    my $timeline = {};
 
-    for my $guest (@$guests) {
-        my $vmid = $guest->{vmid};
-        my $data = eval { _guest_disk_series($vmid, $timeframe, $cf) };
-        next if !$data || !scalar(keys %{ $data->{points} });
+    for my $consumer (@{ _consumer_dirs($node) }) {
+        my $points = {};
+        my $total = 0;
+        my $any = 0;
 
-        $series->{$vmid} = $data->{points};
-        $totals->{$vmid} = $data->{total};
+        for my $entry (PVE::DiskIO::listdir($consumer->{dir})) {
+            next if $entry !~ /\.rrd$/;
+            my $data = _fetch_rrd_file("$consumer->{dir}/$entry", $timeframe, $cf) or next;
+
+            for my $point (@$data) {
+                $timeline->{ $point->{time} } = 1;
+                next if !defined($point->{read}) && !defined($point->{write});
+
+                my $sum = ($point->{read} // 0) + ($point->{write} // 0);
+                $points->{ $point->{time} } += $sum;
+                $total += $sum;
+                $any = 1;
+            }
+        }
+
+        push @$consumers, $consumer;
+        next if !$any;
+
+        $series->{ $consumer->{id} } = $points;
+        $totals->{ $consumer->{id} } = $total;
     }
 
-    my $result = { guests => $guests, series => $series, totals => $totals };
+    my $result = {
+        consumers => $consumers,
+        series => $series,
+        totals => $totals,
+        timeline => $timeline,
+    };
     $guest_history_cache->{$key} = { updated => time(), data => $result };
 
     return $result;
 }
 
-# Rank by how much I/O each guest did across the window being displayed, so
-# the graph names whoever actually mattered for that period.
-sub _ranked_guests {
+sub _ranked_consumers {
     my ($history, $top) = @_;
 
     my $totals = $history->{totals};
-    my $byVmid = { map { $_->{vmid} => $_ } @{ $history->{guests} } };
+    my $by_id = { map { $_->{id} => $_ } @{ $history->{consumers} } };
 
     my @ranked =
-        sort { ($totals->{$b} // 0) <=> ($totals->{$a} // 0) || $a <=> $b }
+        sort { ($totals->{$b} // 0) <=> ($totals->{$a} // 0) || $a cmp $b }
         grep { ($totals->{$_} // 0) > 0 }
         keys %$totals;
 
     my @head = splice(@ranked, 0, $top);
 
     return {
-        top => [map { $byVmid->{$_} } @head],
-        rest => [map { $byVmid->{$_} } @ranked],
+        top => [map { $by_id->{$_} } @head],
+        rest => [map { $by_id->{$_} } @ranked],
     };
+}
+
+# Either identifier is accepted: the guest pages know a vmid, the node chart
+# knows a consumer id and may be pointing at a host unit.
+sub _resolve_consumer {
+    my ($param) = @_;
+
+    return $param->{consumer} if $param->{consumer};
+    return undef if !defined($param->{vmid});
+
+    # A guest's directory is its vmid whichever type it is, so either prefix
+    # resolves to the same place.
+    return "lxc:$param->{vmid}";
 }
 
 # Which disks a guest has recorded history on, and how much it moved on each
 # over the window being displayed, so the chart can rank and colour them.
 sub _guest_disk_totals {
-    my ($node, $vmid, $timeframe, $cf) = @_;
+    my ($node, $id, $timeframe, $cf) = @_;
 
-    my $dir = PVE::DiskIO::guest_rrd_dir($node, $vmid);
-    return [] if !-d $dir;
+    my $dir = PVE::DiskIO::consumer_rrd_dir($node, $id);
+    return [] if !$dir || !-d $dir;
 
     my $raw = PVE::DiskIO::slurp(PVE::DiskIO::index_file($node));
     my $index = defined($raw) ? (eval { decode_json($raw) } || []) : [];
@@ -1012,7 +988,7 @@ sub _guest_disk_totals {
             dev => $names->{$key} // $key,
             total => $total,
             points => $points,
-            via_pool => $flags->{"$vmid/$key"} ? 1 : 0,
+            via_pool => $flags->{"$id/$key"} ? 1 : 0,
         };
     }
 
@@ -1034,7 +1010,20 @@ __PACKAGE__->register_method({
         additionalProperties => 0,
         properties => {
             node => get_standard_option('pve-node'),
-            vmid => get_standard_option('pve-vmid'),
+            vmid => {
+                type => 'integer',
+                optional => 1,
+                description => "A guest. Shorthand for consumer=lxc:<vmid>; the"
+                    . " guest pages use it, the node chart uses consumer.",
+            },
+            consumer => {
+                type => 'string',
+                optional => 1,
+                pattern => '^(?:lxc|qemu|host):.+$',
+                maxLength => 256,
+                description => "A consumer id, as returned by guestlist -- a"
+                    . " guest or a host unit.",
+            },
             timeframe => {
                 type => 'string',
                 enum => ['hour', 'day', 'week', 'month', 'year'],
@@ -1053,8 +1042,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        my $id = _resolve_consumer($param) or return [];
         my $disks = _guest_disk_totals(
-            $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
+            $param->{node}, $id, $param->{timeframe}, $param->{cf} // 'AVERAGE',
         );
 
         return [
@@ -1080,7 +1070,20 @@ __PACKAGE__->register_method({
         additionalProperties => 0,
         properties => {
             node => get_standard_option('pve-node'),
-            vmid => get_standard_option('pve-vmid'),
+            vmid => {
+                type => 'integer',
+                optional => 1,
+                description => "A guest. Shorthand for consumer=lxc:<vmid>; the"
+                    . " guest pages use it, the node chart uses consumer.",
+            },
+            consumer => {
+                type => 'string',
+                optional => 1,
+                pattern => '^(?:lxc|qemu|host):.+$',
+                maxLength => 256,
+                description => "A consumer id, as returned by guestlist -- a"
+                    . " guest or a host unit.",
+            },
             timeframe => {
                 type => 'string',
                 enum => ['hour', 'day', 'week', 'month', 'year'],
@@ -1099,8 +1102,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        my $id = _resolve_consumer($param) or return [];
         my ($disks, $timeline) = _guest_disk_totals(
-            $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
+            $param->{node}, $id, $param->{timeframe}, $param->{cf} // 'AVERAGE',
         );
         return [] if !scalar(@$disks);
 
@@ -1163,17 +1167,18 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $cf = $param->{cf} // 'AVERAGE';
-        my $history = _guest_history($param->{node}, $param->{timeframe}, $cf);
-        my $ranked = _ranked_guests($history, $param->{top} // 8);
+        my $history = _consumer_history($param->{node}, $param->{timeframe}, $cf);
+        my $ranked = _ranked_consumers($history, $param->{top} // 8);
 
         my $out = [];
-        for my $guest (@{ $ranked->{top} }) {
+        for my $consumer (@{ $ranked->{top} }) {
             push @$out, {
-                vmid => $guest->{vmid},
-                name => $guest->{name},
-                type => $guest->{type},
-                field => _guest_field($guest),
-                total => $history->{totals}->{ $guest->{vmid} } // 0,
+                id => $consumer->{id},
+                vmid => $consumer->{vmid},
+                name => $consumer->{name},
+                type => $consumer->{kind},
+                field => _consumer_field($consumer),
+                total => $history->{totals}->{ $consumer->{id} } // 0,
             };
         }
 
@@ -1194,13 +1199,14 @@ __PACKAGE__->register_method({
             @$out,
             map {
                 {
+                    id => $_->{id},
                     vmid => $_->{vmid},
                     name => $_->{name},
-                    type => $_->{type},
-                    field => _guest_field($_),
+                    type => $_->{kind},
+                    field => _consumer_field($_),
                     selectable => 1,
                 }
-            } @{ $history->{guests} },
+            } @{ $history->{consumers} },
         ];
     },
 });
@@ -1256,37 +1262,24 @@ __PACKAGE__->register_method({
 
         my $cf = $param->{cf} // 'AVERAGE';
         my $which = $param->{guest} // 'all';
-        my $history = _guest_history($param->{node}, $param->{timeframe}, $cf);
+        my $history = _consumer_history($param->{node}, $param->{timeframe}, $cf);
+        my $ranked = _ranked_consumers($history, $param->{top} // 8);
 
-        my $rows = {};
+        # Seed the whole window so the axis matches the graphs beside it.
+        my $rows = { map { $_ => { time => $_ + 0 } } keys %{ $history->{timeline} } };
 
-        if ($which ne 'all') {
-            my $points = $history->{series}->{ $which + 0 } or return [];
+        for my $consumer (@{ $ranked->{top} }) {
+            my $field = _consumer_field($consumer);
+            my $points = $history->{series}->{ $consumer->{id} } or next;
             for my $t (keys %$points) {
-                $rows->{$t} = {
-                    time => $t + 0,
-                    read => $points->{$t}->{read},
-                    write => $points->{$t}->{write},
-                };
+                $rows->{$t}->{$field} = $points->{$t};
             }
-        } else {
-            my $ranked = _ranked_guests($history, $param->{top} // 8);
+        }
 
-            for my $guest (@{ $ranked->{top} }) {
-                my $field = _guest_field($guest);
-                my $points = $history->{series}->{ $guest->{vmid} } or next;
-                for my $t (keys %$points) {
-                    my $row = $rows->{$t} //= { time => $t + 0 };
-                    $row->{$field} = $points->{$t}->{total};
-                }
-            }
-
-            for my $guest (@{ $ranked->{rest} }) {
-                my $points = $history->{series}->{ $guest->{vmid} } or next;
-                for my $t (keys %$points) {
-                    my $row = $rows->{$t} //= { time => $t + 0 };
-                    $row->{Other} = ($row->{Other} // 0) + $points->{$t}->{total};
-                }
+        for my $consumer (@{ $ranked->{rest} }) {
+            my $points = $history->{series}->{ $consumer->{id} } or next;
+            for my $t (keys %$points) {
+                $rows->{$t}->{Other} = ($rows->{$t}->{Other} // 0) + $points->{$t};
             }
         }
 

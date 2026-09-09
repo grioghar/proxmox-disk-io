@@ -268,6 +268,22 @@ sub update_rrd {
 # the previous sample and computes over the whole interval, rather than
 # sampling briefly and extrapolating.
 
+# Consumers are guests or host units, so their ids ("lxc:3111", "qemu:101",
+# "host:rebalance-runner.service") become a directory each. Host unit names are
+# sanitised because they are attacker-adjacent only in the sense that anything
+# on the system can create a unit, and they end up as path components.
+sub consumer_rrd_dir {
+    my ($node, $id) = @_;
+
+    my ($kind, $rest) = split(/:/, $id, 2);
+    return undef if !defined($rest) || $rest eq '';
+
+    $rest =~ s/[^A-Za-z0-9_.@-]/_/g;
+    return undef if $rest eq '' || $rest =~ /^\.\.?$/;
+
+    return rrd_dir($node) . ($kind eq 'host' ? "/hosts/$rest" : "/guests/$rest");
+}
+
 sub guest_rrd_dir {
     my ($node, $vmid) = @_;
     return rrd_dir($node) . "/guests/$vmid";
@@ -278,17 +294,30 @@ sub guest_rrd_file {
     return guest_rrd_dir($node, $vmid) . "/$key.rrd";
 }
 
+sub consumer_rrd_file {
+    my ($node, $id, $key) = @_;
+    my $dir = consumer_rrd_dir($node, $id) or return undef;
+    return "$dir/$key.rrd";
+}
+
 sub state_file {
     my ($node) = @_;
     return "$RRD_BASE/$node.state.json";
 }
 
+# Display names for consumers, written by the collector so the query side does
+# not have to go back to pmxcfs for every guest on every request.
+sub consumers_file {
+    my ($node) = @_;
+    return "$RRD_BASE/$node.consumers.json";
+}
+
 our @GUEST_DS_NAMES = qw(read write);
 
-sub ensure_guest_rrd {
-    my ($node, $vmid, $key) = @_;
+sub ensure_consumer_rrd {
+    my ($node, $id, $key) = @_;
 
-    my $file = guest_rrd_file($node, $vmid, $key);
+    my $file = consumer_rrd_file($node, $id, $key) or return undef;
     return $file if -f $file;
 
     make_path(dirname($file));
@@ -307,10 +336,10 @@ sub ensure_guest_rrd {
     return $file;
 }
 
-sub update_guest_rrd {
-    my ($node, $vmid, $key, $time, $read, $write) = @_;
+sub update_consumer_rrd {
+    my ($node, $id, $key, $time, $read, $write) = @_;
 
-    my $file = ensure_guest_rrd($node, $vmid, $key);
+    my $file = ensure_consumer_rrd($node, $id, $key) or return 0;
 
     require RRDs;
     RRDs::update($file, '--', sprintf('%d:%.2f:%.2f', $time, $read, $write));

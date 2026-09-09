@@ -1843,13 +1843,13 @@ Ext.onReady(function () {
             let tf = me.currentTimeframe();
             let base = '/nodes/' + me.nodename + '/disks/io/';
 
-            // Selecting a guest asks a different question -- which disks did
-            // this one touch -- so it lists that guest's disks rather than the
-            // node's guests.
+            // Selecting a consumer asks a different question -- which disks
+            // did this one touch -- so it lists that consumer's disks rather
+            // than the node's consumers.
             if (me.selected !== 'all') {
                 return (
                     base +
-                    'guestdisklist?vmid=' +
+                    'guestdisklist?consumer=' +
                     encodeURIComponent(me.selected) +
                     '&timeframe=' +
                     tf.timeframe +
@@ -1876,7 +1876,7 @@ Ext.onReady(function () {
         },
 
         dataParamName: function () {
-            return this.selected === 'all' ? 'guest' : 'vmid';
+            return this.selected === 'all' ? 'guest' : 'consumer';
         },
 
         extraDataParams: function () {
@@ -1893,14 +1893,19 @@ Ext.onReady(function () {
                 me.roster = entries;
             }
 
-            let rows = [{ key: 'all', label: gettext('Busiest guests') }];
+            let rows = [{ key: 'all', label: gettext('Busiest consumers') }];
             let seen = {};
-            for (const guest of me.roster || []) {
-                if (guest.type === 'other' || !guest.vmid || seen[guest.vmid]) {
+            for (const entry of me.roster || []) {
+                if (entry.type === 'other' || !entry.id || seen[entry.id]) {
                     continue;
                 }
-                seen[guest.vmid] = true;
-                rows.push({ key: String(guest.vmid), label: guest.name + ' (' + guest.vmid + ')' });
+                seen[entry.id] = true;
+                rows.push({
+                    key: entry.id,
+                    label: entry.vmid
+                        ? entry.name + ' (' + entry.vmid + ')'
+                        : entry.name + ' \u2014 ' + gettext('host'),
+                });
             }
             return rows;
         },
@@ -1909,12 +1914,16 @@ Ext.onReady(function () {
             let me = this;
 
             if (me.selected !== 'all') {
-                let guest = (me.roster || []).find((g) => String(g.vmid) === me.selected);
-                let label = guest ? guest.name + ' (' + guest.vmid + ')' : me.selected;
+                let entry = (me.roster || []).find((g) => g.id === me.selected);
+                let label = entry
+                    ? entry.vmid
+                        ? entry.name + ' (' + entry.vmid + ')'
+                        : entry.name
+                    : me.selected;
 
-                // entries here are the guest's disks, busiest first.
+                // entries here are that consumer's disks, busiest first.
                 return {
-                    title: Ext.String.format(gettext('Guest Disk I/O - {0}'), label),
+                    title: Ext.String.format(gettext('Disk I/O - {0}'), label),
                     fields: entries.map((d) => d.dev),
                     fieldTitles: entries.map((d) =>
                         d.via_pool ? d.dev + ' ' + gettext('(via pool)') : d.dev,
@@ -1927,7 +1936,7 @@ Ext.onReady(function () {
             // fields; entries after it are the full node roster for the picker.
             let ranked = entries.filter((g) => !g.selectable);
             return {
-                title: gettext('Disk I/O by Guest'),
+                title: gettext('Disk I/O by Consumer'),
                 fields: ranked.map((g) => g.field),
                 fieldTitles: ranked.map((g) =>
                     g.type === 'other'
