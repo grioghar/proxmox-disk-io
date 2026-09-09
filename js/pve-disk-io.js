@@ -850,6 +850,9 @@ Ext.onReady(function () {
                 }
 
                 if (guest.pool) {
+                    // Keyed by mountpoint, not by the daemon's name: the point
+                    // of this is that the daemon never appears as a consumer.
+                    poolNames[guest.pool] = guest.pool;
                     Object.keys(guest.devices || {}).forEach((devno) => {
                         let cur = guest.devices[devno];
                         let old = (before.devices || {})[devno];
@@ -860,7 +863,6 @@ Ext.onReady(function () {
                         entry.read += U.rate(cur.rbytes, old.rbytes, dt);
                         entry.write += U.rate(cur.wbytes, old.wbytes, dt);
                     });
-                    poolNames[guest.pool] = guest.name;
                     return;
                 }
 
@@ -1049,8 +1051,8 @@ Ext.onReady(function () {
         // A FUSE pool daemon does no work of its own: every byte it moves was
         // asked for by a container or a host process. The block layer cannot
         // see that, so the daemon's per disk bytes are shared out here among
-        // the callers holding files open on the pool, in proportion to what
-        // each of them actually read and wrote through it.
+        // the callers using the pool, in proportion to what each of them
+        // actually read and wrote through it.
         //
         // The quantity handed out is block level throughout -- only the split
         // comes from syscall counters -- so the per disk totals still add up to
@@ -1064,56 +1066,81 @@ Ext.onReady(function () {
                 return;
             }
 
-            let prevFuse = {};
-            (previous.fuse || []).forEach((f) => {
-                prevFuse[f.id] = f;
-            });
+            // Aggregate by owner rather than by pid. Pids churn constantly here
+            // -- a transcode or an unpack is a fresh process every time -- and
+            // matching on them meant a caller vanished from the comparison the
+            // moment its pid changed, which sent its disk's whole load into the
+            // unattributed bucket.
+            let byOwner = function (list) {
+                let out = {};
+                (list || []).forEach((entry) => {
+                    let ownerId =
+                        entry.type === 'lxc' ? 'lxc:' + entry.vmid : 'host:' + entry.unit;
+                    let owner = (out[ownerId] = out[ownerId] || {
+                        ownerId: ownerId,
+                        comm: entry.comm,
+                        rchar: 0,
+                        wchar: 0,
+                        weights: {},
+                    });
+                    owner.rchar += entry.rchar || 0;
+                    owner.wchar += entry.wchar || 0;
+                    Object.keys(entry.weights || {}).forEach((devno) => {
+                        owner.weights[devno] =
+                            (owner.weights[devno] || 0) + entry.weights[devno];
+                    });
+                });
+                return out;
+            };
 
-            let callers = [];
-            (current.fuse || []).forEach((entry) => {
-                let before = prevFuse[entry.id];
-                if (!before) {
+            let before = byOwner(previous.fuse);
+            let now = byOwner(current.fuse);
+
+            let owners = [];
+            Object.keys(now).forEach((ownerId) => {
+                let cur = now[ownerId];
+                let old = before[ownerId];
+                if (!old) {
                     return;
                 }
 
-                let read = U.rate(entry.rchar, before.rchar, dt);
-                let write = U.rate(entry.wchar, before.wchar, dt);
+                let read = U.rate(cur.rchar, old.rchar, dt);
+                let write = U.rate(cur.wchar, old.wchar, dt);
                 if (read + write <= 0) {
                     return;
                 }
 
-                let weights = entry.weights || {};
-                let totalWeight = Object.keys(weights).reduce((sum, k) => sum + weights[k], 0);
-                if (!totalWeight) {
-                    return;
-                }
+                let totalWeight = Object.keys(cur.weights).reduce(
+                    (sum, devno) => sum + cur.weights[devno],
+                    0,
+                );
 
-                callers.push({
-                    ownerId: entry.type === 'lxc' ? 'lxc:' + entry.vmid : 'host:' + entry.unit,
-                    comm: entry.comm,
+                owners.push({
+                    ownerId: ownerId,
+                    comm: cur.comm,
                     read: read,
                     write: write,
-                    weights: weights,
+                    weights: cur.weights,
                     totalWeight: totalWeight,
                 });
             });
 
             let residual = { read: 0, write: 0, disks: {} };
 
-            let rowFor = function (caller) {
-                let row = ctx.rowsById[caller.ownerId];
+            let rowFor = function (owner) {
+                let row = ctx.rowsById[owner.ownerId];
                 if (row) {
                     return row;
                 }
 
                 // The caller does no block I/O of its own, so the main pass
                 // never gave it a row -- everything it does goes via the pool.
-                let known = ctx.byId[caller.ownerId] || {};
+                let known = ctx.byId[owner.ownerId] || {};
                 row = {
-                    id: caller.ownerId,
+                    id: owner.ownerId,
                     vmid: known.vmid,
-                    name: known.name || caller.comm,
-                    type: known.type || (caller.ownerId.indexOf('lxc:') === 0 ? 'lxc' : 'host'),
+                    name: known.name || owner.comm,
+                    type: known.type || (owner.ownerId.indexOf('lxc:') === 0 ? 'lxc' : 'host'),
                     source: 'pool',
                     partial: false,
                     viaPool: true,
@@ -1126,7 +1153,7 @@ Ext.onReady(function () {
                     share: 0,
                     disks: [],
                 };
-                ctx.rowsById[caller.ownerId] = row;
+                ctx.rowsById[owner.ownerId] = row;
                 ctx.guestRows.push(row);
                 return row;
             };
@@ -1141,40 +1168,62 @@ Ext.onReady(function () {
                     return;
                 }
 
-                let shares = callers
-                    .map((caller) => {
-                        let fraction = (caller.weights[devno] || 0) / caller.totalWeight;
-                        return {
-                            caller: caller,
-                            read: caller.read * fraction,
-                            write: caller.write * fraction,
-                        };
-                    })
-                    .filter((share) => share.read + share.write > 0);
+                // Prefer callers with files open on this disk. Failing that,
+                // fall back to every active caller: writeback happens long
+                // after the write, often once the file is closed, so insisting
+                // on a live descriptor would blame nobody for real work that a
+                // real container caused.
+                let onDisk = owners
+                    .filter((o) => o.totalWeight > 0 && (o.weights[devno] || 0) > 0)
+                    .map((o) => ({ owner: o, fraction: o.weights[devno] / o.totalWeight }));
 
-                let readWeight = shares.reduce((sum, share) => sum + share.read, 0);
-                let writeWeight = shares.reduce((sum, share) => sum + share.write, 0);
+                let shares = onDisk.length
+                    ? onDisk
+                    : owners.map((o) => ({ owner: o, fraction: 1 }));
 
-                if (!shares.length || (readWeight <= 0 && writeWeight <= 0)) {
-                    // Writeback of something finished, or a caller that has
-                    // since exited. Losing it silently would make the disk's
-                    // numbers stop adding up, so it is kept as its own row.
+                if (!shares.length) {
+                    // Nothing is using the pool at all, so there is genuinely
+                    // no one to credit. Dropping it would leave the disk's
+                    // numbers not adding up, so it is kept as its own row.
                     residual.read += pool.read;
                     residual.write += pool.write;
                     residual.disks[devno] = true;
                     return;
                 }
 
+                let readWeight = shares.reduce((sum, s) => sum + s.owner.read * s.fraction, 0);
+                let writeWeight = shares.reduce((sum, s) => sum + s.owner.write * s.fraction, 0);
+                let anyWeight = shares.reduce(
+                    (sum, s) => sum + (s.owner.read + s.owner.write) * s.fraction,
+                    0,
+                );
+
                 let dev = (ctx.prevDisks[devno] || {}).dev || devno;
 
                 shares.forEach((share) => {
-                    let read = readWeight > 0 ? pool.read * (share.read / readWeight) : 0;
-                    let write = writeWeight > 0 ? pool.write * (share.write / writeWeight) : 0;
+                    let combined = (share.owner.read + share.owner.write) * share.fraction;
+
+                    // Split reads by who was reading and writes by who was
+                    // writing. When one side has no signal at all, fall back to
+                    // overall activity rather than discarding those bytes.
+                    let read =
+                        readWeight > 0
+                            ? pool.read * ((share.owner.read * share.fraction) / readWeight)
+                            : anyWeight > 0
+                              ? pool.read * (combined / anyWeight)
+                              : 0;
+                    let write =
+                        writeWeight > 0
+                            ? pool.write * ((share.owner.write * share.fraction) / writeWeight)
+                            : anyWeight > 0
+                              ? pool.write * (combined / anyWeight)
+                              : 0;
+
                     if (read + write <= 0) {
                         return;
                     }
 
-                    let row = rowFor(share.caller);
+                    let row = rowFor(share.owner);
                     row.readRate += read;
                     row.writeRate += write;
                     row.totalRate += read + write;
@@ -1197,7 +1246,7 @@ Ext.onReady(function () {
                 ctx.guestRows.push({
                     id: 'pool:unattributed',
                     vmid: undefined,
-                    name: Ext.String.format(gettext('{0} - no active caller'), poolName),
+                    name: Ext.String.format(gettext('{0} (no active caller)'), poolName),
                     type: 'host',
                     source: 'pool',
                     partial: false,

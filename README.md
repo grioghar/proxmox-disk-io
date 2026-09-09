@@ -89,9 +89,16 @@ How it works:
   between callers comes from syscall counters (`rchar`/`wchar`, weighted by how
   many of each caller's open files sit on that disk). So a disk's attributed
   bytes still add up to what the disk really did.
-- I/O with no active caller -- writeback of something already finished, or a
-  process that has since exited -- would otherwise vanish and stop the numbers
-  adding up, so it is kept as a single *"no active caller"* row.
+- Callers are aggregated **by owner, not by pid**. Pids churn constantly here --
+  a transcode or an unpack is a fresh process each time -- and matching on them
+  dropped a caller from the comparison the moment its pid changed, sending that
+  disk's whole load into the unattributed bucket.
+- Writeback happens long after the write, usually once the file is closed, so a
+  disk whose pool traffic has no caller *currently holding a descriptor on it*
+  falls back to splitting across every active caller rather than blaming nobody.
+- Only when nothing at all is using the pool does a *"no active caller"* row
+  appear; dropping those bytes instead would leave the disk's totals not adding
+  up.
 
 The daemon that serves a pool is identified by holding `/dev/fuse` open with the
 mountpoint in its command line, so it never looks like a caller of itself.
