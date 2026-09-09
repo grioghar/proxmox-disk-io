@@ -465,14 +465,14 @@ Ext.onReady(function () {
                     {
                         text: gettext('Read'),
                         dataIndex: 'readRate',
-                        width: 95,
+                        width: 108,
                         align: 'right',
                         renderer: U.renderReadRate,
                     },
                     {
                         text: gettext('Write'),
                         dataIndex: 'writeRate',
-                        width: 95,
+                        width: 108,
                         align: 'right',
                         renderer: U.renderWriteRate,
                     },
@@ -582,14 +582,14 @@ Ext.onReady(function () {
                     {
                         text: gettext('Read'),
                         dataIndex: 'readRate',
-                        width: 95,
+                        width: 108,
                         align: 'right',
                         renderer: U.renderReadRate,
                     },
                     {
                         text: gettext('Write'),
                         dataIndex: 'writeRate',
-                        width: 95,
+                        width: 108,
                         align: 'right',
                         renderer: U.renderWriteRate,
                     },

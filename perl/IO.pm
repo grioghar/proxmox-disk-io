@@ -200,39 +200,6 @@ sub _resolve_physical {
     return @result;
 }
 
-# Device-mapper volumes (LVM LVs, thin volumes, crypt targets), with the
-# physical disks behind each. This is what lets the UI say "this VM's disk
-# lives on sdb" rather than just "on dm-15".
-sub _dm_volumes {
-    my ($physical, $cache) = @_;
-
-    my $volumes = {};
-    for my $name (_listdir('/sys/block')) {
-        next if $name !~ /^dm-/;
-        my $devno = _slurp_trim("/sys/block/$name/dev") or next;
-
-        my $dmname = _slurp_trim("/sys/block/$name/dm/name") // $name;
-        # dmsetup mangles '-' to '--' when composing VG-LV names.
-        my ($vg, $lv);
-        if ($dmname =~ /^((?:[^-]|--)+)-((?:[^-]|--)+)$/) {
-            ($vg, $lv) = ($1, $2);
-            s/--/-/g for ($vg, $lv);
-        }
-
-        $volumes->{$devno} = {
-            dev => $name,
-            devno => $devno,
-            name => $dmname,
-            vg => $vg,
-            lv => $lv,
-            size => (_slurp_trim("/sys/block/$name/size") // 0) * SECTOR_SIZE,
-            disks => [_resolve_physical($devno, $physical, $cache)],
-        };
-    }
-
-    return $volumes;
-}
-
 # Map a filesystem path to the "major:minor" of the device backing it, using
 # the mount table. Used for file-based (dir) storages.
 sub _path_devno_via_mounts {
@@ -275,6 +242,75 @@ sub _path_to_devno {
 
 # --- guests ---------------------------------------------------------------
 
+# Guest names, and the mapping from a VM's drives to the physical disks under
+# them, only change when a guest is created, renamed or reconfigured. Reading
+# them means going to pmxcfs, a FUSE filesystem replicated across the cluster,
+# once per guest -- at a 1-3s poll interval that was by far the most expensive
+# thing this endpoint did. So it is cached, and refreshed either on a timer or
+# immediately when a guest appears that the cache has not seen.
+my $METADATA_TTL = 30;
+my $metadata = { updated => 0, lxc => {}, qemu => {} };
+
+sub _guest_metadata {
+    my ($lxc_ids, $qemu_ids, $physical, $cache) = @_;
+
+    my $fresh = (time() - $metadata->{updated}) < $METADATA_TTL;
+    if ($fresh) {
+        for my $vmid (@$lxc_ids) {
+            $fresh = 0 if !exists $metadata->{lxc}->{$vmid};
+        }
+        for my $vmid (@$qemu_ids) {
+            $fresh = 0 if !exists $metadata->{qemu}->{$vmid};
+        }
+    }
+    return $metadata if $fresh;
+
+    my $next = { updated => time(), lxc => {}, qemu => {} };
+
+    require PVE::LXC::Config;
+    for my $vmid (@$lxc_ids) {
+        my $name = eval { PVE::LXC::Config->load_config($vmid)->{hostname} };
+        $next->{lxc}->{$vmid} = $name // "CT $vmid";
+    }
+
+    require PVE::QemuConfig;
+    require PVE::Storage;
+    my $storecfg = eval { PVE::Storage::config() };
+
+    for my $vmid (@$qemu_ids) {
+        my $conf = eval { PVE::QemuConfig->load_config($vmid) };
+        next if !$conf;
+
+        # Which physical disks each drive lives on, resolved through the
+        # storage layer so LVM, thin, dir and ZFS all work the same way.
+        my $drives = _qemu_drive_volids($conf);
+        my $drive_disks = {};
+
+        for my $key (keys %$drives) {
+            my $volid = $drives->{$key};
+            # Raw device passthrough (/dev/disk/by-id/...) never goes through
+            # the storage layer, so use the path as given.
+            my $path = $volid =~ m{^/}
+                ? $volid
+                : eval { PVE::Storage::path($storecfg, $volid) };
+            next if !$path;
+
+            my $devno = _path_to_devno($path);
+            next if !defined($devno);
+
+            $drive_disks->{$key} = [_resolve_physical($devno, $physical, $cache)];
+        }
+
+        $next->{qemu}->{$vmid} = {
+            name => $conf->{name} // "VM $vmid",
+            drives => $drive_disks,
+        };
+    }
+
+    $metadata = $next;
+    return $metadata;
+}
+
 # cgroup v2 io.stat: one line per device, "maj:min rbytes=.. wbytes=.. ..".
 # The io controller charges every layer of the stack, so a guest on LVM shows
 # up against both the dm device and the physical disk underneath. Summing all
@@ -303,7 +339,7 @@ sub _cgroup_io_stat {
 }
 
 sub _lxc_guests {
-    my ($physical) = @_;
+    my ($physical, $names) = @_;
 
     my $guests = [];
     for my $vmid (_listdir('/sys/fs/cgroup/lxc')) {
@@ -311,13 +347,6 @@ sub _lxc_guests {
 
         my $per_device = _cgroup_io_stat("/sys/fs/cgroup/lxc/$vmid/io.stat");
         next if !defined($per_device);
-
-        my $name;
-        eval {
-            require PVE::LXC::Config;
-            my $conf = PVE::LXC::Config->load_config($vmid);
-            $name = $conf->{hostname};
-        };
 
         my $devices = {};
         my $total = { rbytes => 0, wbytes => 0, rios => 0, wios => 0, dbytes => 0, dios => 0 };
@@ -331,7 +360,7 @@ sub _lxc_guests {
 
         push @$guests, {
             vmid => $vmid + 0,
-            name => $name // "CT $vmid",
+            name => $names->{$vmid} // "CT $vmid",
             type => 'lxc',
             source => 'cgroup',
             devices => $devices,
@@ -362,38 +391,16 @@ sub _qemu_drive_volids {
 }
 
 sub _qemu_guests {
-    my ($physical, $cache) = @_;
+    my ($meta) = @_;
 
     my $guests = [];
-
-    my $storecfg = eval { require PVE::Storage; PVE::Storage::config() };
 
     for my $scope (_listdir('/sys/fs/cgroup/qemu.slice')) {
         next if $scope !~ /^(\d+)\.scope$/;
         my $vmid = $1;
 
-        my $conf = eval {
-            require PVE::QemuConfig;
-            PVE::QemuConfig->load_config($vmid);
-        };
-        next if !$conf;
-
-        # Which physical disks each drive lives on, resolved through the
-        # storage layer so LVM/thin/dir all work the same way.
-        my $drives = _qemu_drive_volids($conf);
-        my $drive_disks = {};
-        for my $key (keys %$drives) {
-            my $volid = $drives->{$key};
-            # Raw device passthrough (/dev/disk/by-id/...) never goes through
-            # the storage layer, so use the path as given.
-            my $path = $volid =~ m{^/}
-                ? $volid
-                : eval { PVE::Storage::path($storecfg, $volid) };
-            next if !$path;
-            my $devno = _path_to_devno($path);
-            next if !defined($devno);
-            $drive_disks->{$key} = [_resolve_physical($devno, $physical, $cache)];
-        }
+        my $info = $meta->{$vmid} or next;
+        my $drive_disks = $info->{drives};
 
         my $blockstats = eval {
             require PVE::QemuServer::Monitor;
@@ -450,7 +457,7 @@ sub _qemu_guests {
 
         push @$guests, {
             vmid => $vmid + 0,
-            name => $conf->{name} // "VM $vmid",
+            name => $info->{name},
             type => 'qemu',
             source => $blockstats ? 'qmp' : 'unavailable',
             devices => $devices,
@@ -494,11 +501,6 @@ __PACKAGE__->register_method({
                 description => "Physical disks with their /proc/diskstats counters.",
                 items => { type => 'object' },
             },
-            volumes => {
-                type => 'array',
-                description => "Device-mapper volumes and the physical disks behind them.",
-                items => { type => 'object' },
-            },
             guests => {
                 type => 'array',
                 description => "Running guests with the I/O they are responsible for.",
@@ -531,23 +533,19 @@ __PACKAGE__->register_method({
             push @$disks, $entry;
         }
 
-        my $volumes = _dm_volumes($physical, $cache);
-        for my $devno (keys %$volumes) {
-            my $stats = $diskstats->{$devno} or next;
-            $volumes->{$devno}->{read_bytes} = $stats->{read_sectors} * SECTOR_SIZE;
-            $volumes->{$devno}->{write_bytes} = $stats->{write_sectors} * SECTOR_SIZE;
-            $volumes->{$devno}->{read_ios} = $stats->{read_ios};
-            $volumes->{$devno}->{write_ios} = $stats->{write_ios};
-        }
+        my $lxc_ids = [grep { /^\d+$/ } _listdir('/sys/fs/cgroup/lxc')];
+        my $qemu_ids =
+            [map { /^(\d+)\.scope$/ ? $1 : () } _listdir('/sys/fs/cgroup/qemu.slice')];
+
+        my $meta = _guest_metadata($lxc_ids, $qemu_ids, $physical, $cache);
 
         my $guests = [];
-        push @$guests, @{ _lxc_guests($physical) };
-        push @$guests, @{ _qemu_guests($physical, $cache) };
+        push @$guests, @{ _lxc_guests($physical, $meta->{lxc}) };
+        push @$guests, @{ _qemu_guests($meta->{qemu}) };
 
         return {
             time => $now,
             disks => $disks,
-            volumes => [values %$volumes],
             guests => $guests,
         };
     },

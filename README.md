@@ -32,7 +32,14 @@ interval.
 | cgroup v2 `io.stat` | per-container I/O, per device |
 | QMP `query-blockstats` | per-VM I/O, per drive |
 
-Two details worth knowing:
+Guest names and the VM drive-to-disk mapping are cached for 30s (and refreshed
+immediately when an unseen guest appears), because reading them means one
+pmxcfs round trip per guest and pmxcfs is a FUSE filesystem replicated across
+the cluster. On a node with 49 guests that cache took the endpoint from ~120ms
+to ~32ms and removed roughly 50 config reads per poll. Measured end to end over
+HTTPS it answers in ~60ms.
+
+Three details worth knowing:
 
 - **Containers.** The cgroup io controller charges every layer of the stack, so
   a container on LVM appears against both the dm device and the physical disk
