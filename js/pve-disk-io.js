@@ -1469,6 +1469,12 @@ Ext.onReady(function () {
     // rebuild the chart when the selection changes. Subclasses supply the URLs
     // and decide what series to draw.
     Ext.define('PVE.node.IOHistoryChart', {
+
+        // Extra query parameters for the data endpoint, for subclasses whose
+        // series depend on more than the timeframe.
+        extraDataParams: function () {
+            return {};
+        },
         extend: 'Ext.panel.Panel',
 
         layout: 'fit',
@@ -1564,7 +1570,7 @@ Ext.onReady(function () {
                 return;
             }
 
-            let params = {};
+            let params = Ext.apply({}, me.extraDataParams());
             params[me.paramName] = me.selected;
 
             me.rrdstore = Ext.create('PVE.data.IOHistoryRRDStore', {
@@ -1727,7 +1733,17 @@ Ext.onReady(function () {
         alias: 'widget.pveNodeGuestIOSummaryChart',
 
         paramName: 'guest',
-        pickerWidth: 280,
+        pickerWidth: 210,
+
+        // The legend sits in the chart header alongside the title and the
+        // picker. Nine series pushed the title to zero width, so the graph
+        // arrived on the Summary page unlabelled; six still answers "who was
+        // busy" while leaving room to say what the graph is.
+        topSeries: 6,
+
+        extraDataParams: function () {
+            return { top: this.topSeries };
+        },
         emptyText: gettext('No guest disk I/O recorded yet.'),
 
         // Which guests are drawn depends on who was busiest in the window on
@@ -1742,7 +1758,9 @@ Ext.onReady(function () {
                 '/disks/io/guestlist?timeframe=' +
                 tf.timeframe +
                 '&cf=' +
-                tf.cf
+                tf.cf +
+                '&top=' +
+                this.topSeries
             );
         },
 
