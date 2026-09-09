@@ -1953,6 +1953,23 @@ Ext.onReady(function () {
     // The node Summary builds its graphs into a single column container. Adding
     // to that after it exists puts these alongside the CPU, memory and network
     // graphs, picking up the same column width, height and padding defaults.
+    // PVE lays its Summary graphs out in a column layout whose widths come from
+    // Proxmox.Utils.updateColumnWidth. That memoises on container.oldFactor and
+    // returns early when the factor has not changed, so anything added after
+    // the first layout keeps whatever columnWidth it was created with and
+    // renders at a different width to the stock graphs -- until a resize
+    // happens to change the factor, which is why it looked like it needed a
+    // refresh. Clearing the memo folds the new charts into the same grid at
+    // once.
+    let joinSummaryGrid = function (container) {
+        let update = Proxmox.Utils.updateColumnWidth || Proxmox.Utils.updateColumns;
+        if (!update) {
+            return;
+        }
+        delete container.oldFactor;
+        update(container);
+    };
+
     Ext.define('PVE.node.DiskIOSummaryInjection', {
         override: 'PVE.node.Summary',
 
@@ -1968,11 +1985,17 @@ Ext.onReady(function () {
                 }
                 let nodename = me.pveSelNode.data.node;
 
+                let added = false;
                 if (!container.down('pveNodeDiskIOSummaryChart')) {
                     container.add({ xtype: 'pveNodeDiskIOSummaryChart', nodename: nodename });
+                    added = true;
                 }
                 if (!container.down('pveNodeGuestIOSummaryChart')) {
                     container.add({ xtype: 'pveNodeGuestIOSummaryChart', nodename: nodename });
+                    added = true;
+                }
+                if (added) {
+                    joinSummaryGrid(container);
                 }
             } catch (err) {
                 if (window.console && window.console.error) {
@@ -2374,10 +2397,8 @@ Ext.onReady(function () {
                     xtype: 'pveGuestDiskHistoryChart',
                     nodename: data.node,
                     vmid: data.vmid,
-                    minHeight: 360,
-                    padding: 5,
-                    columnWidth: 1,
                 });
+                joinSummaryGrid(container);
             } catch (err) {
                 if (window.console && window.console.error) {
                     window.console.error('pve-disk-io: could not add guest summary chart', err);
