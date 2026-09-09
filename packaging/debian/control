@@ -1,0 +1,17 @@
+Package: pve-disk-io
+Version: 1.0.0
+Section: admin
+Priority: optional
+Architecture: all
+Depends: perl, libjson-perl, librrds-perl, systemd
+Recommends: pve-manager
+Maintainer: grioghar <noreply@users.noreply.github.com>
+Homepage: https://github.com/grioghar/proxmox-disk-io
+Description: Disk I/O panel for Proxmox VE
+ Adds a live view of what a node's physical disks are doing and which guests
+ are responsible, plus recorded history on the node and per-guest Summary
+ pages.
+ .
+ I/O that reaches a disk through a FUSE pool such as mergerfs is credited to
+ the container or host process that asked for it, rather than to the pool's
+ daemon, which is what the block layer sees.

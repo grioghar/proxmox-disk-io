@@ -14,21 +14,21 @@ mkdir -p "$H"/{ext6,js}
 
 # Production build. Swap for ext-all-debug.js / charts-debug.js while
 # debugging: the stack traces are far more useful.
-scp pve1:/usr/share/javascript/extjs/ext-all.js            "$H/ext6/"
-scp pve1:/usr/share/javascript/extjs/charts.js             "$H/ext6/"
-scp pve1:/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js "$H/"
-scp pve1:/usr/share/pve-manager/js/pvemanagerlib.js        "$H/js/"
+scp YOUR-NODE:/usr/share/javascript/extjs/ext-all.js            "$H/ext6/"
+scp YOUR-NODE:/usr/share/javascript/extjs/charts.js             "$H/ext6/"
+scp YOUR-NODE:/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js "$H/"
+scp YOUR-NODE:/usr/share/pve-manager/js/pvemanagerlib.js        "$H/js/"
 cp  js/pve-disk-io.js                                      "$H/js/"
 
 # Stylesheets, so the result actually looks like Proxmox.
-rsync -a pve1:/usr/share/javascript/extjs/theme-crisp      "$H/ext6/"
-rsync -a pve1:/usr/share/javascript/extjs/crisp            "$H/ext6/"
-rsync -a pve1:/usr/share/fonts-font-awesome/css            "$H/pve2/fa/"
-rsync -a pve1:/usr/share/fonts-font-awesome/fonts          "$H/pve2/fa/"
-rsync -a pve1:/usr/share/fonts-font-logos/                 "$H/pve2/font-logos/"
-rsync -a pve1:/usr/share/pve-manager/css/                  "$H/pve2/css/"
-rsync -a pve1:/usr/share/javascript/proxmox-widget-toolkit/css/    "$H/pwt/css/"
-rsync -a pve1:/usr/share/javascript/proxmox-widget-toolkit/themes/ "$H/pwt/themes/"
+rsync -a YOUR-NODE:/usr/share/javascript/extjs/theme-crisp      "$H/ext6/"
+rsync -a YOUR-NODE:/usr/share/javascript/extjs/crisp            "$H/ext6/"
+rsync -a YOUR-NODE:/usr/share/fonts-font-awesome/css            "$H/pve2/fa/"
+rsync -a YOUR-NODE:/usr/share/fonts-font-awesome/fonts          "$H/pve2/fa/"
+rsync -a YOUR-NODE:/usr/share/fonts-font-logos/                 "$H/pve2/font-logos/"
+rsync -a YOUR-NODE:/usr/share/pve-manager/css/                  "$H/pve2/css/"
+rsync -a YOUR-NODE:/usr/share/javascript/proxmox-widget-toolkit/css/    "$H/pwt/css/"
+rsync -a YOUR-NODE:/usr/share/javascript/proxmox-widget-toolkit/themes/ "$H/pwt/themes/"
 
 cd "$H" && python3 -m http.server 8899 --bind 127.0.0.1
 ```
@@ -51,7 +51,7 @@ The endpoint returns monotonic counters, so any two samples are enough to
 produce real rates:
 
 ```bash
-ssh pve1 'for i in $(seq 1 8); do pvesh get /nodes/proxmox/disks/io \
+ssh YOUR-NODE 'for i in $(seq 1 8); do pvesh get /nodes/NODENAME/disks/io \
   --output-format json; echo; sleep 2; done' > samples.ndjson
 ```
 
@@ -114,5 +114,5 @@ which is how the panel keeps its accent colours readable in both.
 ## Verify what you tested is what ships
 
 ```bash
-diff <(curl -sk https://pve.grio.co:8006/pve2/js/pve-disk-io.js) js/pve-disk-io.js
+diff <(curl -sk https://YOUR-NODE:8006/pve2/js/pve-disk-io.js) js/pve-disk-io.js
 ```

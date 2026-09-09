@@ -1,9 +1,9 @@
 [Unit]
 Description=Record physical disk I/O counters for the Proxmox VE node Summary graph
-Documentation=file:/root/proxmox-disk-io/README.md
+Documentation=https://github.com/grioghar/proxmox-disk-io
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/pve-disk-io-collector
+ExecStart=/usr/sbin/pve-disk-io-collector
 Nice=10
 IOSchedulingClass=idle

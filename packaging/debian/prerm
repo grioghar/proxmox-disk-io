@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        systemctl disable --now pve-disk-io-collector.timer || true
+        # Put the stock PVE files back while our own are still on disk, since
+        # the integration helper is one of the files about to be removed.
+        if [ -x /usr/share/pve-disk-io/integrate.sh ]; then
+            /usr/share/pve-disk-io/integrate.sh unpatch || true
+        fi
+        ;;
+esac
+
+exit 0

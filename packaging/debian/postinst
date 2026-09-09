@@ -1,0 +1,33 @@
+#!/bin/bash
+set -e
+
+INTEGRATE=/usr/share/pve-disk-io/integrate.sh
+
+case "$1" in
+    configure|triggered)
+        # A pve-manager upgrade rewrites index.html.tpl and Disks.pm, silently
+        # removing the panel. The dpkg trigger below fires when that happens,
+        # and this re-applies the integration -- which is the main reason to
+        # prefer the package over the shell installer.
+        if [ -x "$INTEGRATE" ] && [ -f /usr/share/pve-manager/index.html.tpl ]; then
+            "$INTEGRATE" patch || echo "pve-disk-io: could not wire into PVE" >&2
+        fi
+
+        if [ "$1" = "configure" ]; then
+            systemctl daemon-reload || true
+            systemctl enable --now pve-disk-io-collector.timer || true
+            # Seed a sample so the RRDs exist before the first timer tick.
+            systemctl start pve-disk-io-collector.service || true
+        fi
+
+        # Only bounce the API when it is actually running, so installing on a
+        # node that is mid-boot does not fail.
+        for unit in pvedaemon pveproxy; do
+            if systemctl is-active --quiet "$unit"; then
+                systemctl restart "$unit" || true
+            fi
+        done
+        ;;
+esac
+
+exit 0

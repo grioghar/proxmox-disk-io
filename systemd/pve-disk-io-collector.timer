@@ -1,6 +1,6 @@
 [Unit]
 Description=Sample physical disk I/O every minute
-Documentation=file:/root/proxmox-disk-io/README.md
+Documentation=https://github.com/grioghar/proxmox-disk-io
 
 [Timer]
 # Must match PVE::DiskIO::RRD_STEP (60s). AccuracySec keeps samples close to

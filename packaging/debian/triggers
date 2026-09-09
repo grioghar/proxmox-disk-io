@@ -1,0 +1,5 @@
+# pve-manager upgrades rewrite index.html.tpl and Disks.pm, which removes the
+# integration. Watching the directories they live in lets postinst put it back
+# without the admin having to remember.
+interest-noawait /usr/share/pve-manager
+interest-noawait /usr/share/perl5/PVE/API2

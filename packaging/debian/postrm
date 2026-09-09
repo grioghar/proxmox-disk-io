@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|purge)
+        systemctl daemon-reload || true
+        for unit in pvedaemon pveproxy; do
+            if systemctl is-active --quiet "$unit"; then
+                systemctl restart "$unit" || true
+            fi
+        done
+        ;;
+esac
+
+# Recorded history is deliberately kept on remove: reinstalling picks it back
+# up, and silently discarding months of data would be rude. purge removes it,
+# which is what purge is for.
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/pve-disk-io /var/backups/pve-disk-io
+fi
+
+exit 0

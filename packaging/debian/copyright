@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: proxmox-disk-io
+Source: https://github.com/grioghar/proxmox-disk-io
+
+Files: *
+Copyright: 2026 grioghar
+License: MIT
