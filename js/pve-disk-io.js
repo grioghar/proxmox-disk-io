@@ -1489,12 +1489,6 @@ Ext.onReady(function () {
     // rebuild the chart when the selection changes. Subclasses supply the URLs
     // and decide what series to draw.
     Ext.define('PVE.node.IOHistoryChart', {
-
-        // Extra query parameters for the data endpoint, for subclasses whose
-        // series depend on more than the timeframe.
-        extraDataParams: function () {
-            return {};
-        },
         extend: 'Ext.panel.Panel',
 
         layout: 'fit',
@@ -1503,6 +1497,22 @@ Ext.onReady(function () {
 
         // Key of the entry being plotted, or 'all'.
         selected: 'all',
+
+        // Whether picking something changes what the list endpoint returns,
+        // rather than only which series are drawn from the same list.
+        listDependsOnSelection: false,
+
+        // Extra query parameters for the data endpoint, for subclasses whose
+        // series depend on more than the timeframe.
+        extraDataParams: function () {
+            return {};
+        },
+
+        // The parameter carrying the current selection. A subclass that swaps
+        // endpoints when something is selected needs to swap this with it.
+        dataParamName: function () {
+            return this.paramName;
+        },
 
         // Whether the plotted series depend on the timeframe. They do for
         // guests, where the set drawn is whoever was busiest in that window.
@@ -1591,7 +1601,7 @@ Ext.onReady(function () {
             }
 
             let params = Ext.apply({}, me.extraDataParams());
-            params[me.paramName] = me.selected;
+            params[me.dataParamName()] = me.selected;
 
             me.rrdstore = Ext.create('PVE.data.IOHistoryRRDStore', {
                 rrdurl: me.getDataUrl(),
@@ -1665,7 +1675,17 @@ Ext.onReady(function () {
                         // while ExtJS is still inside the combobox's own change
                         // handling, or it carries on against a destroyed field.
                         Ext.defer(function () {
-                            if (!me.isDestroyed) {
+                            if (me.isDestroyed) {
+                                return;
+                            }
+                            // For the guest chart the list itself depends on the
+                            // selection -- picking a guest asks for that guest's
+                            // disks, not the node's guests -- so the cached
+                            // entries would otherwise be fed to seriesFor() as
+                            // if they were the new thing.
+                            if (me.listDependsOnSelection) {
+                                me.loadList();
+                            } else {
                                 me.buildChart();
                             }
                         }, 1);
@@ -1759,16 +1779,13 @@ Ext.onReady(function () {
 
         paramName: 'guest',
         pickerWidth: 210,
+        listDependsOnSelection: true,
 
         // The legend sits in the chart header alongside the title and the
         // picker. Nine series pushed the title to zero width, so the graph
         // arrived on the Summary page unlabelled; six still answers "who was
         // busy" while leaving room to say what the graph is.
         topSeries: 6,
-
-        extraDataParams: function () {
-            return { top: this.topSeries };
-        },
         emptyText: gettext('No guest disk I/O recorded yet.'),
 
         // Which guests are drawn depends on who was busiest in the window on
@@ -1776,27 +1793,63 @@ Ext.onReady(function () {
         rebuildOnTimeframe: true,
 
         getListUrl: function () {
-            let tf = this.currentTimeframe();
+            let me = this;
+            let tf = me.currentTimeframe();
+            let base = '/nodes/' + me.nodename + '/disks/io/';
+
+            // Selecting a guest asks a different question -- which disks did
+            // this one touch -- so it lists that guest's disks rather than the
+            // node's guests.
+            if (me.selected !== 'all') {
+                return (
+                    base +
+                    'guestdisklist?vmid=' +
+                    encodeURIComponent(me.selected) +
+                    '&timeframe=' +
+                    tf.timeframe +
+                    '&cf=' +
+                    tf.cf
+                );
+            }
+
             return (
-                '/nodes/' +
-                this.nodename +
-                '/disks/io/guestlist?timeframe=' +
+                base +
+                'guestlist?timeframe=' +
                 tf.timeframe +
                 '&cf=' +
                 tf.cf +
                 '&top=' +
-                this.topSeries
+                me.topSeries
             );
         },
 
         getDataUrl: function () {
-            return '/api2/json/nodes/' + this.nodename + '/disks/io/guestrrddata';
+            let me = this;
+            let base = '/api2/json/nodes/' + me.nodename + '/disks/io/';
+            return base + (me.selected === 'all' ? 'guestrrddata' : 'guestdiskrrddata');
+        },
+
+        dataParamName: function () {
+            return this.selected === 'all' ? 'guest' : 'vmid';
+        },
+
+        extraDataParams: function () {
+            return this.selected === 'all' ? { top: this.topSeries } : {};
         },
 
         pickerRows: function (entries) {
+            let me = this;
+
+            // While a guest is selected the loaded list is that guest's disks,
+            // not the node's guests, so the roster is remembered from the last
+            // time it was loaded.
+            if (me.selected === 'all') {
+                me.roster = entries;
+            }
+
             let rows = [{ key: 'all', label: gettext('Busiest guests') }];
             let seen = {};
-            for (const guest of entries) {
+            for (const guest of me.roster || []) {
                 if (guest.type === 'other' || !guest.vmid || seen[guest.vmid]) {
                     continue;
                 }
@@ -1810,13 +1863,16 @@ Ext.onReady(function () {
             let me = this;
 
             if (me.selected !== 'all') {
-                let guest = entries.find((g) => String(g.vmid) === me.selected);
+                let guest = (me.roster || []).find((g) => String(g.vmid) === me.selected);
                 let label = guest ? guest.name + ' (' + guest.vmid + ')' : me.selected;
+
+                // entries here are the guest's disks, busiest first.
                 return {
                     title: Ext.String.format(gettext('Guest Disk I/O - {0}'), label),
-                    fields: ['read', 'write'],
-                    fieldTitles: [gettext('Read'), gettext('Write')],
-                    colors: ['#115fa6', '#94ae0a'],
+                    fields: entries.map((d) => d.dev),
+                    fieldTitles: entries.map((d) => d.dev),
+                    colors: entries.map((d, i) => SERIES_PALETTE[i % SERIES_PALETTE.length]),
+                    seriesConfig: { fill: false, style: { lineWidth: 1.5, opacity: 1 } },
                 };
             }
 

@@ -22,6 +22,7 @@ my $disks = PVE::DiskIO::physical_disks();
 my $stats = PVE::DiskIO::diskstats();
 
 my $taken = {};
+my $disk_keys = {};
 my $index = [];
 my $failures = 0;
 
@@ -35,6 +36,7 @@ for my $devno (sort keys %$disks) {
 
     my $key = PVE::DiskIO::disk_key($disk, $taken);
     $taken->{$key} = 1;
+    $disk_keys->{$devno} = $key;
 
     my $values = [
         $stat->{read_sectors} * PVE::DiskIO::SECTOR_SIZE,
@@ -87,5 +89,86 @@ open(my $fh, '>', $tmp) or die "cannot write $tmp: $!\n";
 print $fh encode_json([sort { $a->{key} cmp $b->{key} } @$index]);
 close($fh);
 rename($tmp, $path) or die "cannot rename $tmp: $!\n";
+
+# --- per (guest, disk) ----------------------------------------------------
+#
+# PVE's guest RRDs have no per-disk dimension, so this adds one. Unlike the
+# per-disk counters above, these cannot be stored as DERIVE: I/O reaching a
+# disk through a FUSE pool has to be apportioned between the pool's callers,
+# and a share is a rate rather than something with a monotonic total behind it.
+# So the previous sample is kept and the rate is computed over the whole
+# interval -- sampling briefly and extrapolating would misrepresent anything
+# bursty, which is most of what runs here.
+
+my $state_path = PVE::DiskIO::state_file($node);
+
+my $sample = eval {
+    require PVE::API2::Disks::IO;
+    PVE::API2::Disks::IO->io({ node => $node, fuse => 1 });
+};
+if (my $err = $@) {
+    warn "cannot sample guest I/O: $err";
+    exit($failures ? 1 : 0);
+}
+
+my $last;
+if (-f $state_path) {
+    my $raw = PVE::DiskIO::slurp($state_path);
+    $last = eval { decode_json($raw) };
+}
+
+if ($last) {
+    my $dt = $sample->{time} - $last->{time};
+
+    # A gap means the collector was stopped, the node was asleep, or the clock
+    # moved. Averaging across it would invent a plateau that never happened, so
+    # the interval is skipped and only the state is refreshed.
+    if ($dt >= 30 && $dt <= 180) {
+        my $attributed = PVE::DiskIO::attribute_io($last, $sample);
+
+        for my $owner (keys %$attributed) {
+            # Host units are consumers too, but this is guest history and the
+            # chart is keyed on vmid; they stay in the live panel only.
+            next if $owner !~ /^(?:lxc|qemu):(\d+)$/;
+            my $vmid = $1;
+
+            for my $devno (keys %{ $attributed->{$owner} }) {
+                my $key = $disk_keys->{$devno} or next;
+                my $io = $attributed->{$owner}->{$devno};
+
+                eval {
+                    PVE::DiskIO::update_guest_rrd(
+                        $node, $vmid, $key, $sample->{time},
+                        $io->{read} // 0, $io->{write} // 0,
+                    );
+                };
+                if (my $err = $@) {
+                    warn "guest $vmid disk $key: $err";
+                    $failures++;
+                }
+            }
+        }
+    }
+}
+
+# Only the parts attribute_io() reads, so the state file stays small.
+my $state = {
+    time => $sample->{time},
+    guests => [
+        map { { id => $_->{id}, pool => $_->{pool}, devices => $_->{devices} } }
+            @{ $sample->{guests} }
+    ],
+    fuse => [
+        map { { id => $_->{id}, type => $_->{type}, vmid => $_->{vmid}, unit => $_->{unit},
+                rchar => $_->{rchar}, wchar => $_->{wchar}, weights => $_->{weights} } }
+            @{ $sample->{fuse} // [] }
+    ],
+};
+
+my $state_tmp = "$state_path.tmp.$$";
+open(my $sfh, '>', $state_tmp) or die "cannot write $state_tmp: $!\n";
+print $sfh encode_json($state);
+close($sfh);
+rename($state_tmp, $state_path) or die "cannot rename $state_tmp: $!\n";
 
 exit($failures ? 1 : 0);

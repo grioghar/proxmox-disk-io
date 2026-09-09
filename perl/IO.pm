@@ -720,9 +720,13 @@ my $TIMEFRAMES = {
 
 sub _fetch_rrd {
     my ($node, $key, $timeframe, $cf) = @_;
+    return _fetch_rrd_file(PVE::DiskIO::rrd_file($node, $key), $timeframe, $cf);
+}
+
+sub _fetch_rrd_file {
+    my ($file, $timeframe, $cf) = @_;
 
     my $spec = $TIMEFRAMES->{ $timeframe // 'hour' } or return undef;
-    my $file = PVE::DiskIO::rrd_file($node, $key);
     return undef if !-f $file;
 
     require RRDs;
@@ -958,6 +962,139 @@ sub _ranked_guests {
         rest => [map { $byVmid->{$_} } @ranked],
     };
 }
+
+# Which disks a guest has recorded history on, and how much it moved on each
+# over the window being displayed, so the chart can rank and colour them.
+sub _guest_disk_totals {
+    my ($node, $vmid, $timeframe, $cf) = @_;
+
+    my $dir = PVE::DiskIO::guest_rrd_dir($node, $vmid);
+    return [] if !-d $dir;
+
+    my $raw = PVE::DiskIO::slurp(PVE::DiskIO::index_file($node));
+    my $index = defined($raw) ? (eval { decode_json($raw) } || []) : [];
+    my $names = { map { $_->{key} => $_->{dev} } @$index };
+
+    my $out = [];
+    for my $entry (PVE::DiskIO::listdir($dir)) {
+        next if $entry !~ /^(.+)\.rrd$/;
+        my $key = $1;
+
+        my $series = _fetch_rrd_file("$dir/$entry", $timeframe, $cf) or next;
+
+        my $total = 0;
+        my $points = {};
+        for my $point (@$series) {
+            my $sum = ($point->{read} // 0) + ($point->{write} // 0);
+            next if !defined($point->{read}) && !defined($point->{write});
+            $points->{ $point->{time} } = $sum;
+            $total += $sum;
+        }
+        next if !scalar(keys %$points);
+
+        push @$out, {
+            key => $key,
+            dev => $names->{$key} // $key,
+            total => $total,
+            points => $points,
+        };
+    }
+
+    return [sort { $b->{total} <=> $a->{total} || $a->{dev} cmp $b->{dev} } @$out];
+}
+
+__PACKAGE__->register_method({
+    name => 'guestdisklist',
+    path => 'guestdisklist',
+    method => 'GET',
+    proxyto => 'node',
+    protected => 1,
+    description => "Disks a guest has recorded I/O history on, busiest first.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            timeframe => {
+                type => 'string',
+                enum => ['hour', 'day', 'week', 'month', 'year'],
+            },
+            cf => {
+                type => 'string',
+                enum => ['AVERAGE', 'MAX'],
+                optional => 1,
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $disks = _guest_disk_totals(
+            $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
+        );
+
+        return [map { { key => $_->{key}, dev => $_->{dev}, total => $_->{total} } } @$disks];
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'guestdiskrrddata',
+    path => 'guestdiskrrddata',
+    method => 'GET',
+    proxyto => 'node',
+    protected => 1,
+    description => "A guest's disk I/O history broken down by physical disk."
+        . " Each row carries one field per disk, named the way the disk grid"
+        . " names it.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            timeframe => {
+                type => 'string',
+                enum => ['hour', 'day', 'week', 'month', 'year'],
+            },
+            cf => {
+                type => 'string',
+                enum => ['AVERAGE', 'MAX'],
+                optional => 1,
+            },
+        },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object' },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $disks = _guest_disk_totals(
+            $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
+        );
+        return [] if !scalar(@$disks);
+
+        my $rows = {};
+        for my $disk (@$disks) {
+            for my $t (keys %{ $disk->{points} }) {
+                my $row = $rows->{$t} //= { time => $t + 0 };
+                $row->{ $disk->{dev} } = $disk->{points}->{$t};
+            }
+        }
+
+        return [map { $rows->{$_} } sort { $a <=> $b } keys %$rows];
+    },
+});
 
 __PACKAGE__->register_method({
     name => 'guestlist',
