@@ -981,6 +981,8 @@ sub _guest_disk_totals {
     my $flags = defined($flags_raw) ? (eval { decode_json($flags_raw) } || {}) : {};
 
     my $out = [];
+    my $timeline = {};
+
     for my $entry (PVE::DiskIO::listdir($dir)) {
         next if $entry !~ /^(.+)\.rrd$/;
         my $key = $1;
@@ -989,13 +991,21 @@ sub _guest_disk_totals {
 
         my $total = 0;
         my $points = {};
+        my $any = 0;
         for my $point (@$series) {
-            my $sum = ($point->{read} // 0) + ($point->{write} // 0);
+            # Keep every timestamp in the window, not only the ones with a
+            # value. Dropping the empty leading rows shortened the x axis, so
+            # the graph did not line up with the ones beside it on the page.
+            $timeline->{ $point->{time} } = 1;
+
             next if !defined($point->{read}) && !defined($point->{write});
+
+            my $sum = ($point->{read} // 0) + ($point->{write} // 0);
             $points->{ $point->{time} } = $sum;
             $total += $sum;
+            $any = 1;
         }
-        next if !scalar(keys %$points);
+        next if !$any;
 
         push @$out, {
             key => $key,
@@ -1006,7 +1016,8 @@ sub _guest_disk_totals {
         };
     }
 
-    return [sort { $b->{total} <=> $a->{total} || $a->{dev} cmp $b->{dev} } @$out];
+    my $disks = [sort { $b->{total} <=> $a->{total} || $a->{dev} cmp $b->{dev} } @$out];
+    return wantarray ? ($disks, $timeline) : $disks;
 }
 
 __PACKAGE__->register_method({
@@ -1088,12 +1099,14 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $disks = _guest_disk_totals(
+        my ($disks, $timeline) = _guest_disk_totals(
             $param->{node}, $param->{vmid}, $param->{timeframe}, $param->{cf} // 'AVERAGE',
         );
         return [] if !scalar(@$disks);
 
-        my $rows = {};
+        # Seed every timestamp the window covers so the axis spans the same
+        # range as the other graphs on the page; gaps render as gaps.
+        my $rows = { map { $_ => { time => $_ + 0 } } keys %$timeline };
         for my $disk (@$disks) {
             for my $t (keys %{ $disk->{points} }) {
                 my $row = $rows->{$t} //= { time => $t + 0 };
