@@ -859,9 +859,16 @@ Ext.onReady(function () {
                         if (!old) {
                             return;
                         }
-                        let entry = (poolRates[devno] = poolRates[devno] || { read: 0, write: 0 });
+                        let entry = (poolRates[devno] = poolRates[devno] || {
+                            read: 0,
+                            write: 0,
+                            readIops: 0,
+                            writeIops: 0,
+                        });
                         entry.read += U.rate(cur.rbytes, old.rbytes, dt);
                         entry.write += U.rate(cur.wbytes, old.wbytes, dt);
+                        entry.readIops += U.rate(cur.rios, old.rios, dt);
+                        entry.writeIops += U.rate(cur.wios, old.wios, dt);
                     });
                     return;
                 }
@@ -1206,27 +1213,40 @@ Ext.onReady(function () {
                     // Split reads by who was reading and writes by who was
                     // writing. When one side has no signal at all, fall back to
                     // overall activity rather than discarding those bytes.
-                    let read =
+                    let readShare =
                         readWeight > 0
-                            ? pool.read * ((share.owner.read * share.fraction) / readWeight)
+                            ? (share.owner.read * share.fraction) / readWeight
                             : anyWeight > 0
-                              ? pool.read * (combined / anyWeight)
+                              ? combined / anyWeight
                               : 0;
-                    let write =
+                    let writeShare =
                         writeWeight > 0
-                            ? pool.write * ((share.owner.write * share.fraction) / writeWeight)
+                            ? (share.owner.write * share.fraction) / writeWeight
                             : anyWeight > 0
-                              ? pool.write * (combined / anyWeight)
+                              ? combined / anyWeight
                               : 0;
+
+                    let read = pool.read * readShare;
+                    let write = pool.write * writeShare;
 
                     if (read + write <= 0) {
                         return;
                     }
 
+                    // The daemon's cgroup counts operations as well as bytes,
+                    // so IOPS can be shared out on exactly the same split.
+                    // Without this a consumer whose I/O is entirely via the
+                    // pool reported no IOPS at all.
+                    let readIops = (pool.readIops || 0) * readShare;
+                    let writeIops = (pool.writeIops || 0) * writeShare;
+
                     let row = rowFor(share.owner);
                     row.readRate += read;
                     row.writeRate += write;
                     row.totalRate += read + write;
+                    row.readIops += readIops;
+                    row.writeIops += writeIops;
+                    row.iops += readIops + writeIops;
                     row.viaPool = true;
                     if (row.disks.indexOf(dev) === -1) {
                         row.disks.push(dev);

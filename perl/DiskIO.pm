@@ -254,4 +254,211 @@ sub update_rrd {
     return 1;
 }
 
+
+# --- per (guest, disk) history -------------------------------------------
+
+# PVE's own guest RRDs record diskread/diskwrite but have no per-disk
+# dimension, so "which guest" is answerable from history while "which guest, on
+# which disk" is not. These add that dimension.
+#
+# Stored as GAUGE rates rather than DERIVE counters, because the figures are
+# not all counters: I/O that reaches a disk through a FUSE pool has to be
+# apportioned between the pool's callers, and an apportioned share is a rate,
+# not something with a monotonic total behind it. The collector therefore keeps
+# the previous sample and computes over the whole interval, rather than
+# sampling briefly and extrapolating.
+
+sub guest_rrd_dir {
+    my ($node, $vmid) = @_;
+    return rrd_dir($node) . "/guests/$vmid";
+}
+
+sub guest_rrd_file {
+    my ($node, $vmid, $key) = @_;
+    return guest_rrd_dir($node, $vmid) . "/$key.rrd";
+}
+
+sub state_file {
+    my ($node) = @_;
+    return "$RRD_BASE/$node.state.json";
+}
+
+our @GUEST_DS_NAMES = qw(read write);
+
+sub ensure_guest_rrd {
+    my ($node, $vmid, $key) = @_;
+
+    my $file = guest_rrd_file($node, $vmid, $key);
+    return $file if -f $file;
+
+    make_path(dirname($file));
+
+    require RRDs;
+    RRDs::create(
+        $file,
+        '--step', RRD_STEP,
+        (map { "DS:$_:GAUGE:120:0:U" } @GUEST_DS_NAMES),
+        _rra_defs(),
+    );
+    if (my $err = RRDs::error()) {
+        die "could not create $file: $err\n";
+    }
+
+    return $file;
+}
+
+sub update_guest_rrd {
+    my ($node, $vmid, $key, $time, $read, $write) = @_;
+
+    my $file = ensure_guest_rrd($node, $vmid, $key);
+
+    require RRDs;
+    RRDs::update($file, '--', sprintf('%d:%.2f:%.2f', $time, $read, $write));
+    if (my $err = RRDs::error()) {
+        return 0 if $err =~ /illegal attempt to update using time/;
+        die "could not update $file: $err\n";
+    }
+
+    return 1;
+}
+
+
+
+# Apportion two samples' worth of I/O to the consumers responsible, per disk.
+#
+# NOTE: this is the same algorithm as distributePoolIO() in pve-disk-io.js.
+# The panel computes rates in the browser so the API can stay stateless, while
+# the collector has to do it here; there is no way to share one implementation
+# across both, so the two must be kept in step by hand.
+#
+# Returns { "<owner id>" => { "<major:minor>" => { read => bytes/s, write => ... } } }
+sub attribute_io {
+    my ($prev, $cur) = @_;
+
+    my $dt = $cur->{time} - $prev->{time};
+    return {} if !$dt || $dt <= 0;
+
+    my $rate = sub {
+        my ($now, $before) = @_;
+        return 0 if !defined($now) || !defined($before);
+        my $delta = $now - $before;
+        return $delta > 0 ? $delta / $dt : 0;
+    };
+
+    my %before = map { $_->{id} => $_ } @{ $prev->{guests} };
+    my $out = {};
+    my $pool = {};
+
+    for my $guest (@{ $cur->{guests} }) {
+        my $old = $before{ $guest->{id} } or next;
+
+        for my $devno (keys %{ $guest->{devices} // {} }) {
+            my $now = $guest->{devices}->{$devno};
+            my $was = ($old->{devices} // {})->{$devno} or next;
+
+            my $read = $rate->($now->{rbytes}, $was->{rbytes});
+            my $write = $rate->($now->{wbytes}, $was->{wbytes});
+            next if $read + $write <= 0;
+
+            # A FUSE daemon's bytes are not its own; hold them back to share out.
+            if ($guest->{pool}) {
+                $pool->{$devno}->{read} += $read;
+                $pool->{$devno}->{write} += $write;
+            } else {
+                $out->{ $guest->{id} }->{$devno}->{read} += $read;
+                $out->{ $guest->{id} }->{$devno}->{write} += $write;
+            }
+        }
+    }
+
+    return $out if !scalar(keys %$pool);
+
+    # Aggregate callers by owner, not by pid: pids churn constantly here, and
+    # matching on them loses a caller the moment its process is replaced.
+    my $by_owner = sub {
+        my ($list) = @_;
+        my $owners = {};
+        for my $entry (@{ $list // [] }) {
+            my $id = $entry->{type} eq 'lxc'
+                ? "lxc:$entry->{vmid}"
+                : "host:" . ($entry->{unit} // 'unknown');
+            my $owner = $owners->{$id} //= { rchar => 0, wchar => 0, weights => {} };
+            $owner->{rchar} += $entry->{rchar} // 0;
+            $owner->{wchar} += $entry->{wchar} // 0;
+            $owner->{weights}->{$_} += $entry->{weights}->{$_}
+                for keys %{ $entry->{weights} // {} };
+        }
+        return $owners;
+    };
+
+    my $was = $by_owner->($prev->{fuse});
+    my $now = $by_owner->($cur->{fuse});
+
+    my $callers = [];
+    for my $id (keys %$now) {
+        my $old = $was->{$id} or next;
+        my $read = $rate->($now->{$id}->{rchar}, $old->{rchar});
+        my $write = $rate->($now->{$id}->{wchar}, $old->{wchar});
+        next if $read + $write <= 0;
+
+        my $weights = $now->{$id}->{weights};
+        my $total = 0;
+        $total += $weights->{$_} for keys %$weights;
+
+        push @$callers, {
+            id => $id,
+            read => $read,
+            write => $write,
+            weights => $weights,
+            total_weight => $total,
+        };
+    }
+
+    return $out if !scalar(@$callers);
+
+    for my $devno (keys %$pool) {
+        my $moved = $pool->{$devno};
+
+        # Prefer callers with a descriptor open on this disk; failing that,
+        # every active caller. Writeback lands long after the file is closed,
+        # so insisting on a live descriptor would credit nobody for real work.
+        my @shares =
+            map { { caller => $_, fraction => $_->{weights}->{$devno} / $_->{total_weight} } }
+            grep { $_->{total_weight} && ($_->{weights}->{$devno} // 0) > 0 } @$callers;
+
+        @shares = map { { caller => $_, fraction => 1 } } @$callers if !scalar(@shares);
+
+        my ($read_w, $write_w, $any_w) = (0, 0, 0);
+        for my $share (@shares) {
+            $read_w += $share->{caller}->{read} * $share->{fraction};
+            $write_w += $share->{caller}->{write} * $share->{fraction};
+            $any_w += ($share->{caller}->{read} + $share->{caller}->{write})
+                * $share->{fraction};
+        }
+
+        for my $share (@shares) {
+            my $caller = $share->{caller};
+            my $combined = ($caller->{read} + $caller->{write}) * $share->{fraction};
+
+            my $read =
+                  $read_w > 0 ? $moved->{read} * ($caller->{read} * $share->{fraction} / $read_w)
+                : $any_w > 0 ? $moved->{read} * ($combined / $any_w)
+                : 0;
+            my $write =
+                  $write_w > 0
+                ? $moved->{write} * ($caller->{write} * $share->{fraction} / $write_w)
+                : $any_w > 0 ? $moved->{write} * ($combined / $any_w)
+                : 0;
+
+            next if $read + $write <= 0;
+
+            $out->{ $caller->{id} }->{$devno}->{read} += $read;
+            $out->{ $caller->{id} }->{$devno}->{write} += $write;
+        }
+    }
+
+    return $out;
+}
+
+
 1;
