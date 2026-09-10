@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the pve-disk-io SMART cache
+Documentation=https://github.com/grioghar/proxmox-disk-io
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-disk-io-smart
+# smartctl on a USB-bridged spinner is slow and can spin an idle drive up;
+# keep it well out of the way of anything serving I/O.
+Nice=15
+IOSchedulingClass=idle

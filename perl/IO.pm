@@ -1525,6 +1525,14 @@ __PACKAGE__->register_method({
             push @$disks, $entry;
         }
 
+        # Health for the drives we just listed. A pure read of the cache the
+        # pve-disk-io-smart timer writes every 10 minutes - smartctl never runs
+        # on this path, so polling the panel cannot keep the drives spun up.
+        my $smart = PVE::DiskIO::smart_status();
+        for my $entry (@$disks) {
+            $entry->{smart} = $smart->{ $entry->{dev} } if $smart->{ $entry->{dev} };
+        }
+
         my $lxc_ids = [grep { /^\d+$/ } PVE::DiskIO::listdir('/sys/fs/cgroup/lxc')];
         my $qemu_ids =
             [map { /^(\d+)\.scope$/ ? $1 : () } PVE::DiskIO::listdir('/sys/fs/cgroup/qemu.slice')];

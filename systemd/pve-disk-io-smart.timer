@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh drive SMART health for the Disk I/O panel every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

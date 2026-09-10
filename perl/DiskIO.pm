@@ -13,6 +13,8 @@ use warnings;
 
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use Fcntl qw(LOCK_EX LOCK_NB LOCK_UN);
+use JSON qw(decode_json encode_json);
 
 # Kernel always reports /proc/diskstats sectors in 512 byte units, regardless
 # of the device's real logical block size.
@@ -120,6 +122,141 @@ sub physical_disks {
 
 # /proc/diskstats keyed by "major:minor". Field order is the documented kernel
 # layout; the discard and flush fields only exist on newer kernels.
+# ── SMART ────────────────────────────────────────────────────────────────────
+# Health for the drives the panel already lists. Deliberately NOT the overall
+# "SMART Health Status" flag on its own: that stays PASSED on a drive with two
+# dozen pending and uncorrectable sectors, which is exactly the case this is
+# meant to catch. Read the attributes that actually predict failure, plus any
+# attribute the drive itself reports as FAILING_NOW.
+#
+# smartctl is slow (a second or so per USB-bridged spinner, and it can spin an
+# idle drive up), so it never runs inline with the I/O poll. A systemd timer
+# refreshes the cache every 10 minutes and the API only ever reads it, so a
+# panel left open cannot keep the drives awake. Each entry carries an `age` in
+# seconds so the UI can say how stale the reading is.
+
+use constant SMART_CACHE => '/run/pve-disk-io-smart.json';
+use constant SMART_LOCK => '/run/pve-disk-io-smart.lock';
+
+# attribute id => key we report
+my %SMART_ATTRS = (
+    5 => 'reallocated',
+    187 => 'reported_uncorrect',
+    197 => 'pending',
+    198 => 'offline_uncorrectable',
+    199 => 'crc_errors',
+);
+
+sub _smart_one {
+    my ($dev, $kind) = @_;
+
+    # Flash runs hot by design: an NVMe at 66C is normal, a spinner at 66C is
+    # cooking. One flat threshold would cry wolf on every SSD in the box.
+    my ($t_warn, $t_crit) = ($kind && $kind ne 'hdd') ? (70, 80) : (55, 60);
+
+    # USB bridges need -d sat; NVMe and plain SATA autodetect fine.
+    my $json;
+    for my $args ([ '-d', 'sat' ], []) {
+        my $cmd = join(' ', 'smartctl', '-j', '-A', '-H', '-i', @$args, "/dev/$dev", '2>/dev/null');
+        my $out = qx{$cmd};
+        next if !defined($out) || $out eq '';
+        my $d = eval { decode_json($out) };
+        next if !$d;
+        if ($d->{ata_smart_attributes} || $d->{smart_status} || $d->{nvme_smart_health_information_log}) {
+            $json = $d;
+            last;
+        }
+    }
+    return undef if !$json;
+
+    my $row = {
+        passed => $json->{smart_status}->{passed} ? 1 : (defined($json->{smart_status}->{passed}) ? 0 : undef),
+        temp => $json->{temperature}->{current},
+        hours => $json->{power_on_time}->{hours},
+    };
+
+    my @failing;
+    for my $a (@{ $json->{ata_smart_attributes}->{table} // [] }) {
+        my $key = $SMART_ATTRS{ $a->{id} // -1 };
+        $row->{$key} = $a->{raw}->{value} + 0 if defined $key;
+        push @failing, $a->{name}
+          if defined($a->{when_failed}) && $a->{when_failed} ne '' && $a->{when_failed} ne '-';
+    }
+    # NVMe reports differently
+    if (my $n = $json->{nvme_smart_health_information_log}) {
+        $row->{temp} //= $n->{temperature};
+        $row->{hours} //= $n->{power_on_hours};
+        $row->{wearout} = $n->{percentage_used};
+    }
+    $row->{failing_now} = \@failing;
+
+    my @problems;
+    push @problems, 'SMART overall health FAILED' if defined($row->{passed}) && !$row->{passed};
+    push @problems, "attribute FAILING_NOW: " . join(', ', @failing) if @failing;
+    for my $pair ([ 'pending', 'pending sectors' ],
+        [ 'offline_uncorrectable', 'uncorrectable sectors' ],
+        [ 'reallocated', 'reallocated sectors' ]) {
+        my ($k, $human) = @$pair;
+        push @problems, "$row->{$k} $human" if ($row->{$k} // 0) > 0;
+    }
+    my $t = $row->{temp};
+    if (defined $t) {
+        push @problems, "${t}C (at or over the ${t_crit}C limit)" if $t >= $t_crit;
+        push @problems, "${t}C (warm)" if $t >= $t_warn && $t < $t_crit;
+    }
+    $row->{problems} = \@problems;
+
+    $row->{state} =
+        (defined($row->{passed}) && !$row->{passed})
+        || @failing
+        || ($row->{pending} // 0) > 0
+        || ($row->{offline_uncorrectable} // 0) > 0
+        || (defined($t) && $t >= $t_crit) ? 'critical'
+      : @problems ? 'warn'
+      : 'ok';
+
+    return $row;
+}
+
+sub smart_refresh {
+    # One refresher at a time: a stampede would spin every drive up at once.
+    open(my $lock, '>', SMART_LOCK) or return 0;
+    return 0 if !flock($lock, LOCK_EX | LOCK_NB);
+
+    my $physical = physical_disks();
+    my $out = { updated => time(), disks => {} };
+    for my $devno (sort keys %$physical) {
+        my $disk = $physical->{$devno};
+        my $row = _smart_one($disk->{dev}, $disk->{kind});
+        $out->{disks}->{ $disk->{dev} } = $row if $row;
+    }
+
+    my $tmp = SMART_CACHE . ".$$";
+    if (open(my $fh, '>', $tmp)) {
+        print {$fh} encode_json($out);
+        close($fh);
+        rename($tmp, SMART_CACHE);
+    } else {
+        unlink($tmp);
+    }
+    flock($lock, LOCK_UN);
+    close($lock);
+    return scalar keys %{ $out->{disks} };
+}
+
+sub smart_status {
+    my $cached = {};
+    if (my $raw = slurp(SMART_CACHE)) {
+        my $d = eval { decode_json($raw) };
+        if ($d && ref($d->{disks}) eq 'HASH') {
+            $cached = $d->{disks};
+            my $age = time() - ($d->{updated} // 0);
+            $_->{age} = $age for values %$cached;
+        }
+    }
+    return $cached;
+}
+
 sub diskstats {
     my $stats = {};
 

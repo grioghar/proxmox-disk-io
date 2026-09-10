@@ -24,6 +24,11 @@ install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.service" \
     /lib/systemd/system/pve-disk-io-collector.service
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.timer" \
     /lib/systemd/system/pve-disk-io-collector.timer
+install -D -m 0755 "$SRC_DIR/bin/pve-disk-io-smart" /usr/sbin/pve-disk-io-smart
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.service" \
+    /lib/systemd/system/pve-disk-io-smart.service
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.timer" \
+    /lib/systemd/system/pve-disk-io-smart.timer
 
 echo "==> wiring into Proxmox VE"
 /usr/share/pve-disk-io/integrate.sh patch
@@ -31,6 +36,9 @@ echo "==> wiring into Proxmox VE"
 echo "==> starting the collector"
 systemctl daemon-reload
 systemctl enable --now pve-disk-io-collector.timer
+# SMART is read on a timer, never inside an API request: smartctl is slow and
+# can spin an idle drive up, so a panel left open must not keep disks awake.
+systemctl enable --now pve-disk-io-smart.timer
 # Seed a sample immediately so the RRDs exist before the first timer tick.
 systemctl start pve-disk-io-collector.service || true
 

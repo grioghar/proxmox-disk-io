@@ -1,0 +1,21 @@
+#!/usr/bin/perl
+# pve-disk-io-smart - refresh the panel's SMART cache.
+#
+# Run from pve-disk-io-smart.timer every 10 minutes. smartctl is slow and can
+# spin an idle drive up, so it must never run inside an API request: the panel
+# reads the cache this writes and nothing else. That also means a dashboard
+# left open overnight cannot keep a pool of USB spinners awake.
+
+use strict;
+use warnings;
+
+use PVE::DiskIO;
+
+my $n = PVE::DiskIO::smart_refresh();
+if (!defined($n)) {
+    print STDERR "pve-disk-io-smart: refresh failed\n";
+    exit 1;
+}
+# 0 means another refresh already held the lock, which is not an error.
+print "pve-disk-io-smart: $n disk(s)\n" if $n;
+exit 0;

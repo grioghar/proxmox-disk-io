@@ -25,9 +25,14 @@ install -D -m 0644 "$SRC_DIR/perl/DiskIO.pm"   "$STAGE/usr/share/perl5/PVE/DiskI
 install -D -m 0644 "$SRC_DIR/perl/IO.pm"       "$STAGE/usr/share/perl5/PVE/API2/Disks/IO.pm"
 install -D -m 0644 "$SRC_DIR/js/pve-disk-io.js" "$STAGE/usr/share/pve-manager/js/pve-disk-io.js"
 install -D -m 0755 "$SRC_DIR/bin/pve-disk-io-collector" "$STAGE/usr/sbin/pve-disk-io-collector"
+install -D -m 0755 "$SRC_DIR/bin/pve-disk-io-smart" "$STAGE/usr/sbin/pve-disk-io-smart"
 install -D -m 0755 "$SRC_DIR/scripts/integrate.sh" "$STAGE/usr/share/pve-disk-io/integrate.sh"
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.service" \
     "$STAGE/lib/systemd/system/pve-disk-io-collector.service"
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.service" \
+    "$STAGE/lib/systemd/system/pve-disk-io-smart.service"
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.timer" \
+    "$STAGE/lib/systemd/system/pve-disk-io-smart.timer"
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.timer" \
     "$STAGE/lib/systemd/system/pve-disk-io-collector.timer"
 install -D -m 0644 "$SRC_DIR/README.md" "$STAGE/usr/share/doc/$PKG/README.md"

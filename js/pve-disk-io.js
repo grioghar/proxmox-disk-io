@@ -91,6 +91,19 @@ Ext.onReady(function () {
     opacity: 0.85;
 }
 .pve-diskio-idle { opacity: 0.45; }
+.pve-diskio-health {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 5px;
+    vertical-align: baseline;
+}
+.pve-diskio-health-ok { background: #21a35b; background: light-dark(#21a35b, #2ecc71); }
+.pve-diskio-health-warn { background: #cf8500; background: light-dark(#cf8500, #ffae0b); }
+.pve-diskio-health-critical { background: #d9342b; background: light-dark(#d9342b, #ff5f56); }
+.pve-diskio-health-unknown { background: #999999; opacity: 0.5; }
+.pve-diskio-health-label { font-size: 11px; }
 
 `;
         document.head.appendChild(style);
@@ -598,6 +611,62 @@ Ext.onReady(function () {
             return '<i class="' + icon + '"></i> ' + Ext.htmlEncode(value);
         },
 
+        // Sort by severity, not alphabetically - "Fail" must come first.
+        sortHealth: function (record) {
+            let order = { critical: 0, warn: 1, unknown: 2, ok: 3 };
+            let state = record.data.smart ? record.data.smart.state : 'unknown';
+            return order[state] !== undefined ? order[state] : 2;
+        },
+
+        renderHealth: function (value, metaData, record) {
+            let smart = record.data.smart;
+            if (!smart) {
+                metaData.tdAttr =
+                    'data-qtip="' + Ext.htmlEncode(gettext('SMART data not available yet')) + '"';
+                return (
+                    '<span class="pve-diskio-health pve-diskio-health-unknown"></span>' +
+                    '<span class="pve-diskio-health-label pve-diskio-idle">-</span>'
+                );
+            }
+            let state = smart.state || 'unknown';
+            // The tooltip carries the detail: the overall SMART flag stays PASSED
+            // on a drive with pending sectors, so the label alone would mislead.
+            let tip = [];
+            if (smart.problems && smart.problems.length) {
+                tip.push(...smart.problems);
+            } else {
+                tip.push(gettext('No SMART problems reported'));
+            }
+            let facts = [];
+            if (smart.temp !== undefined && smart.temp !== null) {
+                facts.push(smart.temp + 'C');
+            }
+            if (smart.hours) {
+                facts.push(Math.round(smart.hours / 24) + ' ' + gettext('days powered on'));
+            }
+            if (smart.wearout !== undefined && smart.wearout !== null) {
+                facts.push(gettext('Wearout') + ' ' + smart.wearout + '%');
+            }
+            if (facts.length) {
+                tip.push(facts.join(' \u00b7 '));
+            }
+            metaData.tdAttr = 'data-qtip="' + Ext.htmlEncode(tip.join('<br>')) + '"';
+
+            let label = {
+                ok: gettext('OK'),
+                warn: gettext('Warn'),
+                critical: gettext('Fail'),
+            }[state] || gettext('Unknown');
+
+            return (
+                '<span class="pve-diskio-health pve-diskio-health-' +
+                Ext.htmlEncode(state) +
+                '"></span><span class="pve-diskio-health-label">' +
+                Ext.htmlEncode(label) +
+                '</span>'
+            );
+        },
+
         renderBus: function (value, metaData, record) {
             let label = value === 'unknown' ? record.data.kind : value;
             return '<span class="pve-diskio-tag">' + Ext.htmlEncode(label) + '</span>';
@@ -718,6 +787,7 @@ Ext.onReady(function () {
                     'transport',
                     'scheduler',
                     'topGuest',
+                    'smart',
                     { name: 'size', type: 'number' },
                     { name: 'readRate', type: 'number' },
                     { name: 'writeRate', type: 'number' },
@@ -936,6 +1006,13 @@ Ext.onReady(function () {
                         dataIndex: 'dev',
                         width: 110,
                         renderer: U.renderDevice,
+                    },
+                    {
+                        text: gettext('Health'),
+                        dataIndex: 'smart',
+                        width: 80,
+                        renderer: U.renderHealth,
+                        sorter: U.sortHealth,
                     },
                     {
                         text: gettext('Bus'),
@@ -1225,6 +1302,7 @@ Ext.onReady(function () {
                 latency: 0,
                 inFlight: disk.in_flight,
                 topGuest: '',
+                smart: disk.smart,
             }));
             me.diskStore.setData(rows);
             me.refreshDiskFilter();
@@ -1312,6 +1390,7 @@ Ext.onReady(function () {
                     latency: latency,
                     inFlight: disk.in_flight,
                     topGuest: topGuest,
+                    smart: disk.smart,
                 };
             });
 
@@ -2101,6 +2180,7 @@ Ext.onReady(function () {
                     'model',
                     'transport',
                     'kind',
+                    'smart',
                     { name: 'readRate', type: 'number' },
                     { name: 'writeRate', type: 'number' },
                     { name: 'totalRate', type: 'number' },
@@ -2144,6 +2224,13 @@ Ext.onReady(function () {
                         dataIndex: 'dev',
                         width: 120,
                         renderer: PVE.node.DiskIOUtils.renderDevice,
+                    },
+                    {
+                        text: gettext('Health'),
+                        dataIndex: 'smart',
+                        width: 80,
+                        renderer: PVE.node.DiskIOUtils.renderHealth,
+                        sorter: PVE.node.DiskIOUtils.sortHealth,
                     },
                     {
                         text: gettext('Bus'),
@@ -2318,6 +2405,7 @@ Ext.onReady(function () {
                     model: disk.model,
                     transport: disk.transport,
                     kind: disk.kind,
+                    smart: disk.smart,
                     readRate: io.read,
                     writeRate: io.write,
                     totalRate: io.read + io.write,
