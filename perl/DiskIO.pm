@@ -173,6 +173,10 @@ sub _smart_one {
         passed => $json->{smart_status}->{passed} ? 1 : (defined($json->{smart_status}->{passed}) ? 0 : undef),
         temp => $json->{temperature}->{current},
         hours => $json->{power_on_time}->{hours},
+        # -i is already in the command, so these are free here and save every
+        # other consumer of this cache from shelling out to identify the drive.
+        model => $json->{model_name},
+        serial => $json->{serial_number},
     };
 
     my @failing;
