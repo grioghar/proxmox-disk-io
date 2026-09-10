@@ -11,8 +11,9 @@ package PVE::DiskIO;
 use strict;
 use warnings;
 
-use File::Basename qw(dirname);
+use File::Basename qw(basename dirname);
 use File::Path qw(make_path);
+use POSIX ();
 use Fcntl qw(LOCK_EX LOCK_NB LOCK_UN);
 use JSON qw(decode_json encode_json);
 
@@ -148,6 +149,89 @@ my %SMART_ATTRS = (
     199 => 'crc_errors',
 );
 
+# Device names come from the API, so never interpolate one into a shell without
+# this: only a real whole-disk node this node actually has may be addressed.
+sub smart_assert_dev {
+    my ($dev) = @_;
+    die "invalid device name\n" if !defined($dev) || $dev !~ /^[a-z0-9]+$/;
+    die "no such disk '$dev'\n" if !-b "/dev/$dev";
+    die "'$dev' is not a whole disk\n" if !-d "/sys/block/$dev";
+    return "/dev/$dev";
+}
+
+# USB bridges need -d sat; NVMe and plain SATA autodetect fine. Returns the
+# decoded JSON and the device-type arguments that worked, so a follow-up
+# command addresses the drive the same way.
+sub smart_probe {
+    my ($dev, @args) = @_;
+    my $path = smart_assert_dev($dev);
+    for my $dargs ([ '-d', 'sat' ], []) {
+        my $cmd = join(' ', 'smartctl', '-j', @args, @$dargs, $path, '2>/dev/null');
+        my $out = qx{$cmd};
+        next if !defined($out) || $out eq '';
+        my $d = eval { decode_json($out) };
+        next if !$d;
+        if ($d->{ata_smart_attributes} || $d->{smart_status}
+            || $d->{nvme_smart_health_information_log}) {
+            return ($d, $dargs);
+        }
+    }
+    return (undef, undef);
+}
+
+# Every mountpoint carried by this disk, including ones reached through
+# partitions, LVM, dm-crypt or md. This is the gate on the destructive actions,
+# so it must not be fooled by stacking: /dev/sda here holds a thin pool with 22
+# guest volumes on dm devices, and a naive /dev/sdX match in mountinfo reports
+# it as unmounted. Walk the holder graph and compare major:minor instead.
+sub disk_mounts {
+    my ($dev) = @_;
+    smart_assert_dev($dev);
+
+    my %want;    # "major:minor" of everything stacked on top of this disk
+    my @seed = ($dev, map { basename($_) } glob("/sys/block/$dev/$dev*"));
+    for my $name (@seed) {
+        my $devno = slurp_trim("/sys/block/$name/dev")
+            // slurp_trim("/sys/block/$dev/$name/dev");
+        $want{$devno} = 1 if defined $devno;
+    }
+
+    # dm/md devices list what they sit on in slaves/. Repeat until nothing new
+    # is added, so a dm target layered on another dm target is still caught.
+    my $added = 1;
+    while ($added) {
+        $added = 0;
+        for my $holder (glob('/sys/block/*')) {
+            my $devno = slurp_trim("$holder/dev");
+            next if !defined($devno) || $want{$devno};
+            for my $slave (glob("$holder/slaves/*")) {
+                my $sdevno = slurp_trim("/sys/class/block/" . basename($slave) . "/dev");
+                next if !defined($sdevno) || !$want{$sdevno};
+                $want{$devno} = 1;
+                $added = 1;
+                last;
+            }
+        }
+    }
+
+    my @mounts;
+    if (open(my $fh, '<', '/proc/self/mountinfo')) {
+        while (my $line = <$fh>) {
+            chomp $line;
+            my @f = split(/\s+/, $line);
+            next if @f < 10;
+            next if !$want{ $f[2] // '' };
+            my $i = 0;
+            $i++ while $i < @f && $f[$i] ne '-';    # optional fields end at '-'
+            my $mp = $f[4] // '';
+            $mp =~ s/\\040/ /g;                      # mountinfo escapes spaces
+            push @mounts, { source => $f[$i + 2] // '', mountpoint => $mp };
+        }
+        close($fh);
+    }
+    return \@mounts;
+}
+
 sub _smart_one {
     my ($dev, $kind) = @_;
 
@@ -155,19 +239,7 @@ sub _smart_one {
     # cooking. One flat threshold would cry wolf on every SSD in the box.
     my ($t_warn, $t_crit) = ($kind && $kind ne 'hdd') ? (70, 80) : (55, 60);
 
-    # USB bridges need -d sat; NVMe and plain SATA autodetect fine.
-    my $json;
-    for my $args ([ '-d', 'sat' ], []) {
-        my $cmd = join(' ', 'smartctl', '-j', '-A', '-H', '-i', @$args, "/dev/$dev", '2>/dev/null');
-        my $out = qx{$cmd};
-        next if !defined($out) || $out eq '';
-        my $d = eval { decode_json($out) };
-        next if !$d;
-        if ($d->{ata_smart_attributes} || $d->{smart_status} || $d->{nvme_smart_health_information_log}) {
-            $json = $d;
-            last;
-        }
-    }
+    my ($json) = smart_probe($dev, '-A', '-H', '-i');
     return undef if !$json;
 
     my $row = {
@@ -734,6 +806,328 @@ sub attribute_io {
     }
 
     return $out;
+}
+
+
+# ── SMART detail and drive actions ──────────────────────────────────────────
+# Everything a "why is this drive unhealthy, and what can I do about it" view
+# needs. Read-only actions and self-tests run on any drive; anything that
+# WRITES to the platters is refused while the disk carries a mounted
+# filesystem, because on this class of box a spinner is usually a live pool
+# branch and a misclick would be unrecoverable.
+
+use constant JOB_DIR => '/run/pve-disk-io-jobs';
+
+# Actions that write to the disk. Each needs the disk unmounted AND the caller
+# to echo back the drive's serial, so neither a stale tab nor a mistyped device
+# name can start one.
+my %DESTRUCTIVE = (
+    rewrite_pending => 1,
+    surface_write_test => 1,
+);
+
+my %ACTIONS = (
+    selftest_short => {
+        label => 'Short self-test',
+        desc => 'The drive tests its own electronics, servo and a sample of the'
+            . ' media. Two minutes, runs in the background, safe at any time.',
+        cmd => [ '-t', 'short' ],
+    },
+    selftest_long => {
+        label => 'Extended self-test',
+        desc => 'Full surface read by the drive itself. Hours on a large disk,'
+            . ' but it is the only way to confirm whether pending sectors are'
+            . ' really unreadable. Safe: it never writes.',
+        cmd => [ '-t', 'long' ],
+    },
+    selftest_conveyance => {
+        label => 'Conveyance self-test',
+        desc => 'Checks for damage in transit. Minutes. Safe.',
+        cmd => [ '-t', 'conveyance' ],
+    },
+    selftest_abort => {
+        label => 'Abort running self-test',
+        desc => 'Stops a self-test that is in progress.',
+        cmd => [ '-X' ],
+    },
+    surface_read_scan => {
+        label => 'Read-only surface scan',
+        desc => 'Reads every block and reports the ones that will not come back.'
+            . ' Never writes, so it is safe on a mounted pool member, but it is'
+            . ' heavy I/O for hours - it is niced and idle-scheduled.',
+        job => 'read',
+    },
+    rewrite_pending => {
+        label => 'Rewrite sectors (force reallocation)',
+        desc => 'Reads each block and writes it back, which makes the drive'
+            . ' retire a pending sector to its spare pool. Data in a sector that'
+            . ' is already unreadable is LOST - the rewrite is what tells the'
+            . ' drive to give up on it. Requires the disk to be unmounted.',
+        job => 'rewrite',
+    },
+    surface_write_test => {
+        label => 'Destructive write/read test',
+        desc => 'Writes patterns across the whole disk and reads them back.'
+            . ' ERASES EVERYTHING. Only for a drive being wiped or proven before'
+            . ' reuse. Requires the disk to be unmounted.',
+        job => 'write',
+    },
+);
+
+sub smart_actions_available {
+    my @out;
+    for my $key (sort keys %ACTIONS) {
+        my $a = $ACTIONS{$key};
+        push @out, {
+            action => $key,
+            label => $a->{label},
+            description => $a->{desc},
+            destructive => $DESTRUCTIVE{$key} ? 1 : 0,
+            long_running => $a->{job} ? 1 : 0,
+        };
+    }
+    return \@out;
+}
+
+sub _job_path {
+    my ($dev, $ext) = @_;
+    return JOB_DIR . "/$dev.$ext";
+}
+
+# A job is 'running' only while its pid is actually alive: a reboot clears
+# /run, and a killed process must not leave the UI waiting forever.
+# kill(0) is not good enough here: it succeeds for a zombie, and it succeeds
+# for whatever unrelated process later inherits a recycled pid. Read the
+# process state instead, and confirm the command line is still our job.
+sub _job_alive {
+    my ($pid, $dev) = @_;
+    return 0 if !$pid;
+    my $stat = slurp("/proc/$pid/stat");
+    return 0 if !defined $stat;
+    # The comm field is parenthesised and may itself contain spaces.
+    return 0 if $stat !~ /\)\s+(\S)/;
+    return 0 if $1 eq 'Z';
+    my $cmdline = slurp("/proc/$pid/cmdline") // '';
+    $cmdline =~ tr/\0/ /;
+    return $cmdline =~ /\Q$dev\E/ ? 1 : 0;
+}
+
+sub job_status {
+    my ($dev) = @_;
+    smart_assert_dev($dev);
+    my $meta = eval { decode_json(slurp(_job_path($dev, 'json')) // '{}') } || {};
+    return undef if !$meta->{action};
+    my $alive = _job_alive($meta->{pid}, $dev);
+    $meta->{running} = $alive;
+    my $log = slurp(_job_path($dev, 'log')) // '';
+    if ($alive) {
+        $meta->{state} = 'running';
+    } elsif ($log =~ /\[pve-disk-io exit (\d+)\]/) {
+        $meta->{exit_code} = $1 + 0;
+        $meta->{state} = $1 == 0 ? 'finished' : 'failed';
+    } else {
+        # No marker and no process: killed, or the node rebooted under it.
+        $meta->{state} = 'interrupted';
+    }
+    my @lines = split(/\n/, $log);
+    $meta->{log} = join("\n", @lines > 200 ? @lines[ -200 .. -1 ] : @lines);
+    return $meta;
+}
+
+sub job_cancel {
+    my ($dev) = @_;
+    my $meta = job_status($dev);
+    die "no job to cancel\n" if !$meta || !$meta->{running};
+    # The job gets its own session (setsid), so the shell and the badblocks it
+    # spawned share a process group. Signalling just the shell's pid leaves the
+    # scan orphaned and still pinning the disk, which is the opposite of what
+    # "cancel" is for - signal the whole group.
+    kill('TERM', -$meta->{pid}) or kill('TERM', $meta->{pid});
+    return { cancelled => 1, pid => $meta->{pid} };
+}
+
+# badblocks modes: -n rewrites each block in place (non-destructive to readable
+# data, which is what forces a pending sector to be retired), -w destroys
+# everything, no flag at all is a pure read.
+# badblocks counts blocks in a 32-bit integer, so at its default 1024-byte
+# block size it refuses anything over 2TB ("must be 32-bit value"). At 4096 it
+# reaches ~17.6TB, which covers every spinner this is likely to meet. Passing
+# the device's own logical block size would be wrong on a 512e drive: it would
+# put us straight back under the limit.
+use constant BADBLOCKS_BS => 4096;
+
+my %JOB_CMD = (
+    read => [ 'badblocks', '-sv', '-b', BADBLOCKS_BS ],
+    rewrite => [ 'badblocks', '-nsv', '-b', BADBLOCKS_BS ],
+    write => [ 'badblocks', '-wsv', '-b', BADBLOCKS_BS ],
+);
+
+sub smart_action {
+    my ($dev, $action, $confirm) = @_;
+
+    my $path = smart_assert_dev($dev);
+    my $spec = $ACTIONS{ $action // '' };
+    die "unknown action\n" if !$spec;
+
+    my $mounts = disk_mounts($dev);
+    my ($json) = smart_probe($dev, '-i');
+    my $serial = $json ? ($json->{serial_number} // '') : '';
+
+    if ($DESTRUCTIVE{$action}) {
+        if (@$mounts) {
+            die "refusing: /dev/$dev carries "
+                . scalar(@$mounts)
+                . " mounted filesystem(s) ("
+                . join(', ', map { $_->{mountpoint} } @$mounts)
+                . "). Unmount them first.\n";
+        }
+        die "this drive reports no serial number, so it cannot be confirmed\n"
+            if $serial eq '';
+        die "confirmation does not match the drive serial\n"
+            if !defined($confirm) || $confirm ne $serial;
+    }
+
+    # Short commands (self-tests) just run and return.
+    if ($spec->{cmd}) {
+        my (undef, $dargs) = smart_probe($dev, '-i');
+        my @cmd = ('smartctl', @{ $spec->{cmd} }, @{ $dargs // [] }, $path);
+        my $out = qx{@{[ join(' ', @cmd) ]} 2>&1} // '';
+        return { started => 1, action => $action, output => $out };
+    }
+
+    # Long ones detach, so the request returns immediately and progress is read
+    # back through job_status.
+    my $existing = job_status($dev);
+    die "a $existing->{action} job is already running on $dev\n"
+        if $existing && $existing->{running};
+
+    make_path(JOB_DIR) if !-d JOB_DIR;
+    my $log = _job_path($dev, 'log');
+    my @cmd = (@{ $JOB_CMD{ $spec->{job} } }, $path);
+
+    # Single-quote each argument rather than quotemeta: quotemeta's backslash
+    # escaping happens to survive sh, but only by accident, and it makes the
+    # logged command line unreadable.
+    my $shell = join(' ', map { my $a = $_; $a =~ s/'/'\\''/g; "'$a'" } @cmd);
+    my $meta = {
+        action => $action,
+        label => $spec->{label},
+        dev => $dev,
+        started => time(),
+        destructive => $DESTRUCTIVE{$action} ? 1 : 0,
+        cmd => join(' ', @cmd),
+        state => 'running',
+    };
+
+    # Double fork. A single fork leaves the job as our child, and once it
+    # finishes nobody reaps it - a zombie's pid still answers kill(0), so the
+    # UI would report a finished scan as running forever. The middle process
+    # exits at once, which orphans the job to init, and init reaps it.
+    my $pidfile = _job_path($dev, 'pid');
+    unlink($pidfile);
+    my $mid = fork();
+    die "fork failed: $!\n" if !defined $mid;
+    if (!$mid) {
+        POSIX::setsid();
+        my $job = fork();
+        if (!defined $job) {
+            POSIX::_exit(127);
+        }
+        if (!$job) {
+            open(STDIN, '<', '/dev/null');
+            open(STDOUT, '>', $log);
+            open(STDERR, '>&', \*STDOUT);
+            # A surface scan must never outrank the I/O it shares the box with.
+            # The exit marker is how job_status later tells "finished" from
+            # "died on the first line", once the process is gone.
+            exec('/bin/sh', '-c',
+                "ionice -c3 nice -n15 $shell; "
+                . "printf '\\n[pve-disk-io exit %d]\\n' \"\$?\"")
+                or POSIX::_exit(127);
+        }
+        if (open(my $fh, '>', $pidfile)) {
+            print {$fh} $job;
+            close($fh);
+        }
+        POSIX::_exit(0);
+    }
+    waitpid($mid, 0);
+
+    # The middle process writes the pid before exiting; it is a couple of
+    # microseconds behind us, so allow a moment rather than racing it.
+    my $pid;
+    for (1 .. 50) {
+        $pid = slurp_trim($pidfile);
+        last if defined($pid) && $pid =~ /^\d+$/;
+        select(undef, undef, undef, 0.02);
+    }
+    die "job failed to start\n" if !defined($pid) || $pid !~ /^\d+$/;
+
+    $meta->{pid} = $pid + 0;
+    if (open(my $fh, '>', _job_path($dev, 'json'))) {
+        print {$fh} encode_json($meta);
+        close($fh);
+    }
+    return { started => 1, action => $action, pid => $meta->{pid}, cmd => $meta->{cmd} };
+}
+
+sub smart_detail {
+    my ($dev) = @_;
+
+    my $path = smart_assert_dev($dev);
+    my ($json, $dargs) = smart_probe($dev, '-x');
+    die "no SMART data available for /dev/$dev\n" if !$json;
+
+    my @attrs;
+    for my $a (@{ $json->{ata_smart_attributes}->{table} // [] }) {
+        my $wf = $a->{when_failed} // '';
+        push @attrs, {
+            id => $a->{id},
+            name => $a->{name},
+            value => $a->{value},
+            worst => $a->{worst},
+            thresh => $a->{thresh},
+            raw => $a->{raw}->{string} // $a->{raw}->{value},
+            # 'now' means below threshold right now; 'past' is the sticky WORST
+            # column and says nothing about the drive's condition today.
+            when_failed => $wf,
+        };
+    }
+
+    my @selftests;
+    for my $t (@{ $json->{ata_smart_self_test_log}->{standard}->{table} // [] }) {
+        push @selftests, {
+            type => $t->{type}->{string},
+            status => $t->{status}->{string},
+            passed => $t->{status}->{passed} ? 1 : 0,
+            hours => $t->{lifetime_hours},
+            lba => $t->{lba_of_first_error},
+        };
+    }
+
+    my $prog = $json->{ata_smart_data}->{self_test}->{status};
+
+    return {
+        dev => $dev,
+        model => $json->{model_name},
+        serial => $json->{serial_number},
+        firmware => $json->{firmware_version},
+        capacity => $json->{user_capacity}->{bytes},
+        rotation => $json->{rotation_rate},
+        passed => $json->{smart_status}->{passed} ? 1 : 0,
+        temperature => $json->{temperature}->{current},
+        hours => $json->{power_on_time}->{hours},
+        attributes => \@attrs,
+        selftest_log => \@selftests,
+        selftest_running => ($prog && $prog->{remaining_percent}) ? 1 : 0,
+        selftest_remaining => $prog ? $prog->{remaining_percent} : undef,
+        selftest_status => $prog ? $prog->{string} : undef,
+        error_count => $json->{ata_smart_error_log}->{summary}->{count} // 0,
+        mounts => disk_mounts($dev),
+        job => job_status($dev),
+        actions => smart_actions_available(),
+        smartctl_args => join(' ', @{ $dargs // [] }),
+    };
 }
 
 

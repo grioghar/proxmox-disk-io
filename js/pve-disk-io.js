@@ -104,6 +104,29 @@ Ext.onReady(function () {
 .pve-diskio-health-critical { background: #d9342b; background: light-dark(#d9342b, #ff5f56); }
 .pve-diskio-health-unknown { background: #999999; opacity: 0.5; }
 .pve-diskio-health-label { font-size: 11px; }
+.pve-diskio-smart-btn {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 3px;
+    border: 1px solid var(--pwt-panel-border, #cfcfcf);
+    font-size: 11px;
+    cursor: pointer;
+    opacity: 0.8;
+}
+.pve-diskio-smart-btn:hover { opacity: 1; }
+.pve-diskio-attr-failnow { color: #d9342b; color: light-dark(#d9342b, #ff5f56); font-weight: bold; }
+.pve-diskio-attr-failpast { opacity: 0.65; font-style: italic; }
+.pve-diskio-danger {
+    border: 1px solid #d9342b;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+}
+.pve-diskio-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+}
 .pve-diskio-temp {
     font-size: 11px;
     margin-left: 6px;
@@ -702,7 +725,13 @@ Ext.onReady(function () {
                 '"></span><span class="pve-diskio-health-label">' +
                 Ext.htmlEncode(label) +
                 '</span>' +
-                temp
+                temp +
+                // Opens the drive window. Handled by a cellclick listener on
+                // the grid rather than a real button, so the cell keeps
+                // sorting and the column stays narrow.
+                ' <span class="pve-diskio-smart-btn" data-diskio-smart="1">' +
+                Ext.htmlEncode(gettext('SMART')) +
+                '</span>'
             );
         },
 
@@ -740,6 +769,434 @@ Ext.onReady(function () {
     });
 
     // ------------------------------------------------------------ KPI strip
+
+    // ── SMART detail and drive actions ───────────────────────────────────────
+    // Two windows: the drive window (identity, what is wrong, what can be done)
+    // and, from it, the full report. Actions that write to the disk go through
+    // a third confirmation window that makes you type the serial, and the API
+    // refuses them anyway while the disk carries a mounted filesystem - the UI
+    // guard is a courtesy, the server's is the real one.
+
+    Ext.define('PVE.node.DiskSmartReportWindow', {
+        extend: 'Ext.window.Window',
+        title: gettext('SMART Report'),
+        width: 820,
+        height: 560,
+        modal: true,
+        layout: 'fit',
+
+        initComponent: function () {
+            let me = this;
+            let d = me.detail;
+
+            let attrStore = Ext.create('Ext.data.Store', {
+                fields: ['id', 'name', 'value', 'worst', 'thresh', 'raw', 'when_failed'],
+                data: d.attributes || [],
+            });
+            let testStore = Ext.create('Ext.data.Store', {
+                fields: ['type', 'status', 'passed', 'hours', 'lba'],
+                data: d.selftest_log || [],
+            });
+
+            me.items = [
+                {
+                    xtype: 'tabpanel',
+                    items: [
+                        {
+                            title: gettext('Attributes'),
+                            xtype: 'grid',
+                            store: attrStore,
+                            emptyText: gettext('No attributes reported'),
+                            viewConfig: { stripeRows: true },
+                            columns: [
+                                { text: gettext('ID'), dataIndex: 'id', width: 55 },
+                                {
+                                    text: gettext('Attribute'),
+                                    dataIndex: 'name',
+                                    flex: 1,
+                                    renderer: Ext.String.htmlEncode,
+                                },
+                                { text: gettext('Value'), dataIndex: 'value', width: 65, align: 'right' },
+                                { text: gettext('Worst'), dataIndex: 'worst', width: 65, align: 'right' },
+                                { text: gettext('Thresh'), dataIndex: 'thresh', width: 70, align: 'right' },
+                                {
+                                    // The distinction the old code got wrong:
+                                    // 'now' is a live failure, 'past' is only
+                                    // the sticky WORST column and never clears.
+                                    text: gettext('Failed'),
+                                    dataIndex: 'when_failed',
+                                    width: 120,
+                                    renderer: function (v) {
+                                        if (v === 'now') {
+                                            return (
+                                                '<span class="pve-diskio-attr-failnow">' +
+                                                gettext('FAILING NOW') +
+                                                '</span>'
+                                            );
+                                        }
+                                        if (v === 'past') {
+                                            return (
+                                                '<span class="pve-diskio-attr-failpast">' +
+                                                gettext('in the past') +
+                                                '</span>'
+                                            );
+                                        }
+                                        return '-';
+                                    },
+                                },
+                                {
+                                    text: gettext('Raw'),
+                                    dataIndex: 'raw',
+                                    width: 150,
+                                    renderer: Ext.String.htmlEncode,
+                                },
+                            ],
+                        },
+                        {
+                            title: gettext('Self-test log'),
+                            xtype: 'grid',
+                            store: testStore,
+                            emptyText: gettext('This drive has no recorded self-tests'),
+                            columns: [
+                                {
+                                    text: gettext('Type'),
+                                    dataIndex: 'type',
+                                    flex: 1,
+                                    renderer: Ext.String.htmlEncode,
+                                },
+                                {
+                                    text: gettext('Result'),
+                                    dataIndex: 'status',
+                                    flex: 1,
+                                    renderer: function (v, m, rec) {
+                                        let html = Ext.String.htmlEncode(v || '');
+                                        return rec.data.passed
+                                            ? html
+                                            : '<span class="pve-diskio-attr-failnow">' + html + '</span>';
+                                    },
+                                },
+                                { text: gettext('Power-on hours'), dataIndex: 'hours', width: 130, align: 'right' },
+                                { text: gettext('First bad LBA'), dataIndex: 'lba', width: 130, align: 'right' },
+                            ],
+                        },
+                    ],
+                },
+            ];
+            me.buttons = [{ text: gettext('Close'), handler: () => me.close() }];
+            me.callParent();
+        },
+    });
+
+    // Typing the serial is the point: it forces you to look at the drive you
+    // are about to destroy rather than the row you happened to click.
+    Ext.define('PVE.node.DiskSmartConfirmWindow', {
+        extend: 'Ext.window.Window',
+        width: 540,
+        modal: true,
+        layout: 'fit',
+
+        initComponent: function () {
+            let me = this;
+            let serial = me.detail.serial || '';
+            let mounted = (me.detail.mounts || []).length > 0;
+
+            let field = Ext.create('Ext.form.field.Text', {
+                fieldLabel: gettext('Type the serial to confirm'),
+                labelWidth: 190,
+                emptyText: serial,
+                disabled: mounted,
+                enableKeyEvents: true,
+                listeners: {
+                    change: function (f, v) {
+                        me.down('#confirmBtn').setDisabled(mounted || v !== serial);
+                    },
+                },
+            });
+
+            let warning =
+                '<div class="pve-diskio-danger"><b>' +
+                Ext.String.htmlEncode(me.actionLabel) +
+                '</b><br>' +
+                Ext.String.htmlEncode(me.actionDesc) +
+                '</div>';
+
+            if (mounted) {
+                warning +=
+                    '<div class="pve-diskio-danger"><b>' +
+                    gettext('Blocked: this disk is in use.') +
+                    '</b><br>' +
+                    gettext('Mounted here') +
+                    ': ' +
+                    Ext.String.htmlEncode(
+                        me.detail.mounts.map((m) => m.mountpoint).join(', '),
+                    ) +
+                    '<br>' +
+                    gettext(
+                        'Unmount every filesystem on this disk before running a write action. The server refuses it regardless of what this window allows.',
+                    ) +
+                    '</div>';
+            }
+
+            me.title = gettext('Confirm') + ' - /dev/' + me.detail.dev;
+            me.items = [
+                {
+                    xtype: 'panel',
+                    bodyPadding: 12,
+                    border: false,
+                    items: [
+                        { xtype: 'box', html: warning },
+                        {
+                            xtype: 'box',
+                            html:
+                                '<div class="pve-diskio-mono">' +
+                                Ext.String.htmlEncode(
+                                    (me.detail.model || '') + '  ' + serial,
+                                ) +
+                                '</div><br>',
+                        },
+                        field,
+                    ],
+                },
+            ];
+            me.buttons = [
+                { text: gettext('Cancel'), handler: () => me.close() },
+                {
+                    text: gettext('Run'),
+                    itemId: 'confirmBtn',
+                    disabled: true,
+                    handler: function () {
+                        me.runAction(field.getValue());
+                        me.close();
+                    },
+                },
+            ];
+            me.callParent();
+        },
+    });
+
+    Ext.define('PVE.node.DiskSmartWindow', {
+        extend: 'Ext.window.Window',
+        width: 700,
+        modal: true,
+        layout: 'fit',
+        scrollable: true,
+
+        initComponent: function () {
+            let me = this;
+            me.title = gettext('Drive health') + ' - /dev/' + me.dev;
+            me.items = [{ xtype: 'panel', bodyPadding: 12, border: false, itemId: 'body' }];
+            me.buttons = [
+                {
+                    text: gettext('Refresh'),
+                    handler: () => me.load(),
+                },
+                '->',
+                { text: gettext('Close'), handler: () => me.close() },
+            ];
+            me.callParent();
+            me.load();
+        },
+
+        // Poll only while a long job or a self-test is actually in flight.
+        scheduleRefresh: function () {
+            let me = this;
+            Ext.defer(function () {
+                if (!me.isDestroyed) {
+                    me.load();
+                }
+            }, 5000);
+        },
+
+        load: function () {
+            let me = this;
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.nodename + '/disks/io/smartdetail?dev=' + encodeURIComponent(me.dev),
+                method: 'GET',
+                success: function (response) {
+                    if (me.isDestroyed) {
+                        return;
+                    }
+                    me.detail = response.result.data;
+                    me.render();
+                },
+                failure: function (response) {
+                    if (!me.isDestroyed) {
+                        me.down('#body').update(
+                            '<div class="pve-diskio-danger">' +
+                                Ext.String.htmlEncode(response.htmlStatus || 'request failed') +
+                                '</div>',
+                        );
+                    }
+                },
+            });
+        },
+
+        runAction: function (action, confirm) {
+            let me = this;
+            let params = { dev: me.dev, action: action };
+            if (confirm !== undefined) {
+                params.confirm = confirm;
+            }
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.nodename + '/disks/io/smartaction',
+                method: 'POST',
+                params: params,
+                success: function () {
+                    if (!me.isDestroyed) {
+                        me.load();
+                    }
+                },
+                failure: function (response) {
+                    Ext.Msg.alert(gettext('Action refused'), response.htmlStatus || 'failed');
+                },
+            });
+        },
+
+        render: function () {
+            let me = this;
+            let d = me.detail;
+            let body = me.down('#body');
+            body.removeAll();
+
+            let facts = [
+                [gettext('Model'), d.model],
+                [gettext('Serial'), d.serial],
+                [gettext('Firmware'), d.firmware],
+                [gettext('Temperature'), d.temperature !== undefined ? d.temperature + ' °C' : '-'],
+                [
+                    gettext('Powered on'),
+                    d.hours ? Math.round(d.hours / 24) + ' ' + gettext('days') : '-',
+                ],
+                [gettext('Overall SMART'), d.passed ? gettext('PASSED') : gettext('FAILED')],
+                [
+                    gettext('Mounted'),
+                    (d.mounts || []).length
+                        ? d.mounts.map((m) => m.mountpoint).join(', ')
+                        : gettext('not mounted'),
+                ],
+            ];
+
+            let failingNow = (d.attributes || []).filter((a) => a.when_failed === 'now');
+            let failedPast = (d.attributes || []).filter((a) => a.when_failed === 'past');
+
+            let summary = '<table style="width:100%">';
+            facts.forEach(function (row) {
+                summary +=
+                    '<tr><td style="opacity:0.7;padding-right:12px">' +
+                    Ext.String.htmlEncode(row[0]) +
+                    '</td><td>' +
+                    Ext.String.htmlEncode(row[1] === undefined || row[1] === null ? '-' : '' + row[1]) +
+                    '</td></tr>';
+            });
+            summary += '</table>';
+
+            if (failingNow.length) {
+                summary +=
+                    '<div class="pve-diskio-danger" style="margin-top:10px"><b>' +
+                    gettext('Attributes failing now') +
+                    ':</b> ' +
+                    Ext.String.htmlEncode(failingNow.map((a) => a.name).join(', ')) +
+                    '</div>';
+            }
+            if (failedPast.length) {
+                summary +=
+                    '<div style="margin-top:10px;opacity:0.75">' +
+                    gettext('Failed in the past (sticky, does not reflect the drive today)') +
+                    ': ' +
+                    Ext.String.htmlEncode(failedPast.map((a) => a.name).join(', ')) +
+                    '</div>';
+            }
+            if (d.selftest_running) {
+                summary +=
+                    '<div style="margin-top:10px"><b>' +
+                    gettext('Self-test running') +
+                    ':</b> ' +
+                    Ext.String.htmlEncode(d.selftest_status || '') +
+                    '</div>';
+            }
+            if (d.job) {
+                summary +=
+                    '<div style="margin-top:10px"><b>' +
+                    Ext.String.htmlEncode(d.job.label || d.job.action) +
+                    ':</b> ' +
+                    Ext.String.htmlEncode(d.job.state) +
+                    '<div class="pve-diskio-mono">' +
+                    Ext.String.htmlEncode((d.job.log || '').split('\n').slice(-6).join('\n')) +
+                    '</div></div>';
+            }
+
+            body.add({ xtype: 'box', html: summary });
+
+            let buttons = (d.actions || []).map(function (a) {
+                return {
+                    xtype: 'button',
+                    text: a.label,
+                    margin: '4 6 0 0',
+                    tooltip: a.description,
+                    // A write action on a mounted disk cannot succeed, so do
+                    // not present it as if it could.
+                    disabled: a.destructive && (d.mounts || []).length > 0,
+                    handler: function () {
+                        if (!a.destructive) {
+                            me.runAction(a.action);
+                            return;
+                        }
+                        Ext.create('PVE.node.DiskSmartConfirmWindow', {
+                            detail: d,
+                            actionLabel: a.label,
+                            actionDesc: a.description,
+                            runAction: function (confirm) {
+                                me.runAction(a.action, confirm);
+                            },
+                        }).show();
+                    },
+                };
+            });
+
+            buttons.push({
+                xtype: 'button',
+                text: gettext('Full SMART report'),
+                margin: '4 6 0 0',
+                handler: function () {
+                    Ext.create('PVE.node.DiskSmartReportWindow', { detail: d }).show();
+                },
+            });
+
+            if (d.job && d.job.running) {
+                buttons.push({
+                    xtype: 'button',
+                    text: gettext('Cancel running job'),
+                    margin: '4 6 0 0',
+                    handler: () => me.runAction('cancel_job'),
+                });
+            }
+
+            body.add({
+                xtype: 'fieldset',
+                title: gettext('Diagnose and repair'),
+                margin: '12 0 0 0',
+                layout: { type: 'table', columns: 3 },
+                items: buttons,
+            });
+
+            if ((d.mounts || []).length) {
+                body.add({
+                    xtype: 'box',
+                    margin: '8 0 0 0',
+                    html:
+                        '<div style="opacity:0.75">' +
+                        gettext(
+                            'Write actions are disabled because this disk carries a mounted filesystem. Unmount it first; the server enforces this independently.',
+                        ) +
+                        '</div>',
+                });
+            }
+
+            if (d.selftest_running || (d.job && d.job.running)) {
+                me.scheduleRefresh();
+            }
+        },
+    });
 
     Ext.define('PVE.node.DiskIOSummary', {
         extend: 'Ext.Component',
@@ -1039,6 +1496,17 @@ Ext.onReady(function () {
                     deferEmptyText: false,
                     preserveScrollOnRefresh: true,
                 },
+                listeners: {
+                    cellclick: function (view, td, cellIndex, record, tr, rowIndex, e) {
+                        if (!e.getTarget('[data-diskio-smart]')) {
+                            return;
+                        }
+                        Ext.create('PVE.node.DiskSmartWindow', {
+                            nodename: me.nodename,
+                            dev: record.data.dev,
+                        }).show();
+                    },
+                },
                 columns: [
                     {
                         text: gettext('Device'),
@@ -1049,7 +1517,7 @@ Ext.onReady(function () {
                     {
                         text: gettext('Health'),
                         dataIndex: 'smart',
-                        width: 118,
+                        width: 168,
                         renderer: U.renderHealth,
                         sorter: U.sortHealth,
                     },

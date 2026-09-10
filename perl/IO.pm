@@ -1559,4 +1559,98 @@ __PACKAGE__->register_method({
     },
 });
 
+__PACKAGE__->register_method({
+    name => 'smartdetail',
+    path => 'smartdetail',
+    method => 'GET',
+    proxyto => 'node',
+    protected => 1,
+    description => "Full SMART report for one disk: attributes with their"
+        . " current pass/fail state, the self-test log, any running self-test,"
+        . " every filesystem the disk carries, and the actions that can be run"
+        . " against it. Reads the drive directly, so it is not for polling.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            dev => {
+                type => 'string',
+                pattern => '[a-z0-9]+',
+                maxLength => 32,
+                description => "Kernel name of a whole disk, e.g. 'sdb'.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        return PVE::DiskIO::smart_detail($param->{dev});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'smartaction',
+    path => 'smartaction',
+    method => 'POST',
+    proxyto => 'node',
+    protected => 1,
+    description => "Run a diagnostic or repair action against one disk."
+        . " Self-tests and the read-only scan are safe on a live disk. Actions"
+        . " that write are refused while the disk carries a mounted filesystem,"
+        . " and additionally require 'confirm' to equal the drive's serial"
+        . " number, so no single mistake can start one.",
+    permissions => {
+        # Writing to a disk is not an audit operation.
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            dev => {
+                type => 'string',
+                pattern => '[a-z0-9]+',
+                maxLength => 32,
+                description => "Kernel name of a whole disk, e.g. 'sdb'.",
+            },
+            action => {
+                type => 'string',
+                enum => [
+                    'selftest_short', 'selftest_long', 'selftest_conveyance',
+                    'selftest_abort', 'surface_read_scan', 'rewrite_pending',
+                    'surface_write_test', 'cancel_job',
+                ],
+                description => "Which action to run.",
+            },
+            confirm => {
+                type => 'string',
+                optional => 1,
+                maxLength => 64,
+                description => "The drive's serial number. Required for any"
+                    . " action that writes to the disk.",
+            },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $user = $rpcenv->get_user();
+
+        if ($param->{action} eq 'cancel_job') {
+            syslog('info', "disk-io: $user cancels job on $param->{dev}");
+            return PVE::DiskIO::job_cancel($param->{dev});
+        }
+
+        # Anything that reaches the platters is worth a syslog line naming who
+        # asked for it.
+        syslog('info', "disk-io: $user runs $param->{action} on $param->{dev}");
+        return PVE::DiskIO::smart_action($param->{dev}, $param->{action}, $param->{confirm});
+    },
+});
+
 1;

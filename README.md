@@ -66,6 +66,46 @@ It follows the theme:
 
 ![The same panel in the dark theme](docs/img/io-activity-dark.png)
 
+### Drive health, and doing something about it
+
+The Health column carries a **SMART** button. It opens a window with the
+drive's identity, temperature, power-on hours, which filesystems it carries,
+and — the part the overall SMART flag hides — which attributes are failing
+**now** as opposed to at some point in the past.
+
+That distinction matters more than it sounds. `smartctl` reports each
+attribute's `when_failed` as `now`, `past` or nothing at all, where `past` is
+derived from the sticky `WORST` column and **never clears**. A drive that ran
+hot once is marked forever, so treating `past` as a current fault means a
+healthy drive shows as failing for the rest of its life. Only `now` means the
+attribute is below its threshold today.
+
+From that window, a row of actions:
+
+| Action | Writes? | Notes |
+|---|---|---|
+| Short self-test | no | ~2 minutes, the drive tests itself |
+| Extended self-test | no | Full surface read; hours, but the only way to confirm pending sectors are really unreadable |
+| Conveyance self-test | no | Checks for transit damage |
+| Abort running self-test | no | |
+| Read-only surface scan | no | Reads every block and reports what will not come back. Safe on a mounted disk; niced and `ionice -c3` |
+| Full SMART report | no | Second window: every attribute, plus the self-test log |
+| Rewrite sectors | **yes** | Forces a pending sector to be retired to the spare pool. Data in an already-unreadable sector is lost — the rewrite is what tells the drive to give up on it |
+| Destructive write/read test | **yes** | Erases the disk |
+
+**The two write actions are gated twice.** The UI disables them when the disk
+carries a mounted filesystem, and the API refuses them independently — so a
+stale browser tab cannot start one. They also require you to type the drive's
+serial number to confirm, which forces you to look at the drive rather than the
+row you happened to click. The mount check walks the whole stacking graph
+(partitions → LVM → dm-crypt → md), because a disk holding an LVM thin pool has
+no filesystem mounted from `/dev/sdX` itself and a naive check calls it idle.
+
+Long-running scans detach and report progress back into the window, so closing
+it does not kill the job. Every action is written to the syslog with the user
+who asked for it, and the write actions need `Sys.Modify` rather than the
+`Sys.Audit` the rest of the panel uses.
+
 ### Node → Summary → Disk I/O
 
 Recorded per-disk history, beside the CPU, memory and network graphs, driven by
