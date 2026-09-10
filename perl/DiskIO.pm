@@ -180,12 +180,18 @@ sub _smart_one {
         serial => $json->{serial_number},
     };
 
-    my @failing;
+    # smartctl's when_failed is one of '' (never), 'now', or 'past'. Only 'now'
+    # means the attribute is below its threshold RIGHT NOW; 'past' is derived
+    # from the sticky WORST column and, once set, never clears no matter how
+    # healthy the drive becomes. Treating 'past' as current made every drive
+    # that ever ran hot look like it was failing forever.
+    my (@failing, @failed_past);
     for my $a (@{ $json->{ata_smart_attributes}->{table} // [] }) {
         my $key = $SMART_ATTRS{ $a->{id} // -1 };
         $row->{$key} = $a->{raw}->{value} + 0 if defined $key;
-        push @failing, $a->{name}
-          if defined($a->{when_failed}) && $a->{when_failed} ne '' && $a->{when_failed} ne '-';
+        my $wf = $a->{when_failed} // '';
+        push @failing, $a->{name} if $wf eq 'now';
+        push @failed_past, $a->{name} if $wf eq 'past';
     }
     # NVMe reports differently
     if (my $n = $json->{nvme_smart_health_information_log}) {
@@ -194,6 +200,9 @@ sub _smart_one {
         $row->{wearout} = $n->{percentage_used};
     }
     $row->{failing_now} = \@failing;
+    # Reported for context only. It must never reach @problems, or a
+    # long-cooled drive would sit at 'warn' for the rest of its life.
+    $row->{failed_past} = \@failed_past;
 
     my @problems;
     push @problems, 'SMART overall health FAILED' if defined($row->{passed}) && !$row->{passed};
