@@ -104,6 +104,23 @@ Ext.onReady(function () {
 .pve-diskio-health-critical { background: #d9342b; background: light-dark(#d9342b, #ff5f56); }
 .pve-diskio-health-unknown { background: #999999; opacity: 0.5; }
 .pve-diskio-health-label { font-size: 11px; }
+.pve-diskio-temp {
+    font-size: 11px;
+    margin-left: 6px;
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+}
+.pve-diskio-temp-warm {
+    opacity: 1;
+    color: #cf8500;
+    color: light-dark(#cf8500, #ffae0b);
+}
+.pve-diskio-temp-hot {
+    opacity: 1;
+    font-weight: 700;
+    color: #d9342b;
+    color: light-dark(#d9342b, #ff5f56);
+}
 
 `;
         document.head.appendChild(style);
@@ -639,7 +656,9 @@ Ext.onReady(function () {
             }
             let facts = [];
             if (smart.temp !== undefined && smart.temp !== null) {
-                facts.push(smart.temp + 'C');
+                let ta = smart.temp_age !== undefined && smart.temp_age !== null
+                    ? ' (' + smart.temp_age + 's ago)' : '';
+                facts.push(gettext('Temperature') + ' ' + smart.temp + 'C' + ta);
             }
             if (smart.hours) {
                 facts.push(Math.round(smart.hours / 24) + ' ' + gettext('days powered on'));
@@ -658,12 +677,32 @@ Ext.onReady(function () {
                 critical: gettext('Fail'),
             }[state] || gettext('Unknown');
 
+            // Temperature rides in the cell rather than only the tooltip: it is
+            // the one value here that moves minute to minute, and it is
+            // refreshed on its own fast timer, so it is worth seeing at a glance.
+            let temp = '';
+            if (smart.temp !== undefined && smart.temp !== null) {
+                let hot =
+                    smart.temp >= (smart.t_crit || 60)
+                        ? ' pve-diskio-temp-hot'
+                        : smart.temp >= (smart.t_warn || 55)
+                          ? ' pve-diskio-temp-warm'
+                          : '';
+                temp =
+                    '<span class="pve-diskio-temp' +
+                    hot +
+                    '">' +
+                    smart.temp +
+                    '\u00b0C</span>';
+            }
+
             return (
                 '<span class="pve-diskio-health pve-diskio-health-' +
                 Ext.htmlEncode(state) +
                 '"></span><span class="pve-diskio-health-label">' +
                 Ext.htmlEncode(label) +
-                '</span>'
+                '</span>' +
+                temp
             );
         },
 
@@ -1010,7 +1049,7 @@ Ext.onReady(function () {
                     {
                         text: gettext('Health'),
                         dataIndex: 'smart',
-                        width: 80,
+                        width: 118,
                         renderer: U.renderHealth,
                         sorter: U.sortHealth,
                     },
@@ -2228,7 +2267,7 @@ Ext.onReady(function () {
                     {
                         text: gettext('Health'),
                         dataIndex: 'smart',
-                        width: 80,
+                        width: 118,
                         renderer: PVE.node.DiskIOUtils.renderHealth,
                         sorter: PVE.node.DiskIOUtils.sortHealth,
                     },

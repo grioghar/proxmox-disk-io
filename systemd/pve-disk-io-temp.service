@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh drive temperatures for the Disk I/O panel
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-disk-io-temp
+Nice=15
+IOSchedulingClass=idle

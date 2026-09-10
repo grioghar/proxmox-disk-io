@@ -1,0 +1,21 @@
+#!/usr/bin/perl
+# pve-disk-io-temp - refresh drive temperatures for the Disk I/O panel.
+#
+# Split from the full SMART refresh because temperature is the one value that
+# moves on a human timescale: pending sectors do not change between polls, a
+# drive's temperature can climb 15C during a rebalance. This runs every minute
+# and costs ~0.17s per drive; the full SMART sweep stays on its 10-minute
+# timer. Drives in standby are skipped rather than woken.
+
+use strict;
+use warnings;
+
+use PVE::DiskIO;
+
+my $n = PVE::DiskIO::temp_refresh();
+if (!defined($n)) {
+    print STDERR "pve-disk-io-temp: refresh failed\n";
+    exit 1;
+}
+print "pve-disk-io-temp: $n drive(s)\n" if $n;
+exit 0;

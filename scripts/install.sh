@@ -25,10 +25,15 @@ install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.service" \
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-collector.timer" \
     /lib/systemd/system/pve-disk-io-collector.timer
 install -D -m 0755 "$SRC_DIR/bin/pve-disk-io-smart" /usr/sbin/pve-disk-io-smart
+install -D -m 0755 "$SRC_DIR/bin/pve-disk-io-temp" /usr/sbin/pve-disk-io-temp
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.service" \
     /lib/systemd/system/pve-disk-io-smart.service
 install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-smart.timer" \
     /lib/systemd/system/pve-disk-io-smart.timer
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-temp.service" \
+    /lib/systemd/system/pve-disk-io-temp.service
+install -D -m 0644 "$SRC_DIR/systemd/pve-disk-io-temp.timer" \
+    /lib/systemd/system/pve-disk-io-temp.timer
 
 echo "==> wiring into Proxmox VE"
 /usr/share/pve-disk-io/integrate.sh patch
@@ -39,6 +44,9 @@ systemctl enable --now pve-disk-io-collector.timer
 # SMART is read on a timer, never inside an API request: smartctl is slow and
 # can spin an idle drive up, so a panel left open must not keep disks awake.
 systemctl enable --now pve-disk-io-smart.timer
+# Temperature moves minute to minute where the rest of SMART does not, so it
+# gets its own fast timer using the cheap SCT temperature log.
+systemctl enable --now pve-disk-io-temp.timer
 # Seed a sample immediately so the RRDs exist before the first timer tick.
 systemctl start pve-disk-io-collector.service || true
 

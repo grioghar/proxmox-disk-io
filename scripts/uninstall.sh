@@ -11,7 +11,11 @@ fi
 echo "==> stopping the collector"
 systemctl disable --now pve-disk-io-collector.timer 2>/dev/null || true
 systemctl disable --now pve-disk-io-smart.timer 2>/dev/null || true
-rm -f /lib/systemd/system/pve-disk-io-smart.timer \
+systemctl disable --now pve-disk-io-temp.timer 2>/dev/null || true
+rm -f /lib/systemd/system/pve-disk-io-temp.timer \
+      /lib/systemd/system/pve-disk-io-temp.service \
+      /run/pve-disk-io-temp.json \
+      /lib/systemd/system/pve-disk-io-smart.timer \
       /lib/systemd/system/pve-disk-io-smart.service \
       /run/pve-disk-io-smart.json \
       /lib/systemd/system/pve-disk-io-collector.timer \
@@ -28,7 +32,8 @@ rm -f /usr/share/perl5/PVE/DiskIO.pm \
       /usr/share/perl5/PVE/API2/Disks/IO.pm \
       /usr/share/pve-manager/js/pve-disk-io.js \
       /usr/sbin/pve-disk-io-collector \
-      /usr/sbin/pve-disk-io-smart
+      /usr/sbin/pve-disk-io-smart \
+      /usr/sbin/pve-disk-io-temp
 rm -rf /usr/share/pve-disk-io
 
 echo "==> restarting pvedaemon and pveproxy"

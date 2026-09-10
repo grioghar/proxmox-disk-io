@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh drive temperatures every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

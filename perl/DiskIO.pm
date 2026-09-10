@@ -137,6 +137,7 @@ sub physical_disks {
 
 use constant SMART_CACHE => '/run/pve-disk-io-smart.json';
 use constant SMART_LOCK => '/run/pve-disk-io-smart.lock';
+use constant TEMP_CACHE => '/run/pve-disk-io-temp.json';
 
 # attribute id => key we report
 my %SMART_ATTRS = (
@@ -203,19 +204,19 @@ sub _smart_one {
         my ($k, $human) = @$pair;
         push @problems, "$row->{$k} $human" if ($row->{$k} // 0) > 0;
     }
-    my $t = $row->{temp};
-    if (defined $t) {
-        push @problems, "${t}C (at or over the ${t_crit}C limit)" if $t >= $t_crit;
-        push @problems, "${t}C (warm)" if $t >= $t_warn && $t < $t_crit;
-    }
-    $row->{problems} = \@problems;
 
+    # Temperature is deliberately NOT folded in here. It moves far faster than
+    # anything else on this list, so it is refreshed separately and combined
+    # when the cache is read - otherwise the panel would show a 10-minute-old
+    # temperature next to a live one.
+    $row->{problems} = \@problems;
+    $row->{t_warn} = $t_warn;
+    $row->{t_crit} = $t_crit;
     $row->{state} =
         (defined($row->{passed}) && !$row->{passed})
         || @failing
         || ($row->{pending} // 0) > 0
-        || ($row->{offline_uncorrectable} // 0) > 0
-        || (defined($t) && $t >= $t_crit) ? 'critical'
+        || ($row->{offline_uncorrectable} // 0) > 0 ? 'critical'
       : @problems ? 'warn'
       : 'ok';
 
@@ -248,6 +249,74 @@ sub smart_refresh {
     return scalar keys %{ $out->{disks} };
 }
 
+sub temp_refresh {
+    # Temperature only, via the SCT temperature status log: ~0.17s per drive
+    # against ~0.5s for a full attribute read, which is what makes a fast loop
+    # affordable at all. -n standby means a drive that has spun down is left
+    # alone rather than woken every minute - a sleeping drive is not the one
+    # you are worried about overheating.
+    my $physical = physical_disks();
+    my $out = { updated => time(), disks => {} };
+    for my $devno (sort keys %$physical) {
+        my $dev = $physical->{$devno}->{dev};
+        my $temp;
+
+        # NVMe publishes temperature through hwmon, which is a plain sysfs read
+        # and costs nothing at all. Use it rather than a device command.
+        if ($dev =~ /^nvme/) {
+            # The controller hangs the hwmon directly off the device node, so
+            # it is /sys/block/nvme0n1/device/hwmonN, not .../hwmon/hwmonN.
+            for my $node (glob("/sys/block/$dev/device/hwmon*/temp1_input"),
+                glob("/sys/block/$dev/device/hwmon/hwmon*/temp1_input")) {
+                my $raw = slurp_trim($node);
+                if (defined($raw) && $raw =~ /^\d+$/) {
+                    $temp = int($raw / 1000);
+                    last;
+                }
+            }
+            if (defined $temp) {
+                $out->{disks}->{$dev} = $temp;
+                next;
+            }
+        }
+
+        for my $args ([ '-d', 'sat' ], []) {
+            my $cmd = join(' ', 'smartctl', '-n', 'standby', '-l', 'scttempsts',
+                @$args, "/dev/$dev", '2>/dev/null');
+            my $out_txt = qx{$cmd} // '';
+            if ($out_txt =~ /Current Temperature:\s+(\d+)/) {
+                $temp = $1 + 0;
+                last;
+            }
+        }
+        $out->{disks}->{$dev} = $temp if defined $temp;
+    }
+
+    my $tmp = TEMP_CACHE . ".$$";
+    if (open(my $fh, '>', $tmp)) {
+        print {$fh} encode_json($out);
+        close($fh);
+        rename($tmp, TEMP_CACHE);
+    } else {
+        unlink($tmp);
+        return undef;
+    }
+    return scalar keys %{ $out->{disks} };
+}
+
+sub temp_cache {
+    my $out = {};
+    if (my $raw = slurp(TEMP_CACHE)) {
+        my $d = eval { decode_json($raw) };
+        if ($d && ref($d->{disks}) eq 'HASH') {
+            my $age = time() - ($d->{updated} // 0);
+            $out = { map { $_ => { temp => $d->{disks}->{$_}, age => $age } }
+                  keys %{ $d->{disks} } };
+        }
+    }
+    return $out;
+}
+
 sub smart_status {
     my $cached = {};
     if (my $raw = slurp(SMART_CACHE)) {
@@ -257,6 +326,29 @@ sub smart_status {
             my $age = time() - ($d->{updated} // 0);
             $_->{age} = $age for values %$cached;
         }
+    }
+
+    # Fold in the fast temperature reading and re-derive the verdict from it,
+    # so a drive that has just started cooking shows as such immediately.
+    my $temps = temp_cache();
+    for my $dev (keys %$cached) {
+        my $row = $cached->{$dev};
+        if (my $fresh = $temps->{$dev}) {
+            $row->{temp} = $fresh->{temp};
+            $row->{temp_age} = $fresh->{age};
+        }
+        my $t = $row->{temp};
+        next if !defined $t;
+        my ($warn, $crit) = ($row->{t_warn} // 55, $row->{t_crit} // 60);
+        my @p = @{ $row->{problems} // [] };
+        if ($t >= $crit) {
+            push @p, "${t}C (at or over the ${crit}C limit)";
+            $row->{state} = 'critical';
+        } elsif ($t >= $warn) {
+            push @p, "${t}C (warm)";
+            $row->{state} = 'warn' if $row->{state} eq 'ok';
+        }
+        $row->{problems} = \@p;
     }
     return $cached;
 }
