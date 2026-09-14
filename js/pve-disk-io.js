@@ -144,6 +144,19 @@ Ext.onReady(function () {
     color: #d9342b;
     color: light-dark(#d9342b, #ff5f56);
 }
+/* A horizontal DOM legend is one nowrap row that scrolls sideways. PVE's own
+   graphs never have more than four series so it never overflows, but one
+   series per disk or per guest runs off the right edge -- and a legend at the
+   foot of a chart shows no sign that it scrolls, so those entries simply look
+   missing. Let the items wrap onto as many rows as they need instead; the card
+   grows to fit them. */
+.pve-diskio-card .x-legend-container {
+    display: block;
+    white-space: normal;
+}
+.pve-diskio-card .x-legend {
+    overflow: visible;
+}
 
 `;
         document.head.appendChild(style);
@@ -2117,9 +2130,26 @@ Ext.onReady(function () {
     Ext.define('PVE.node.IOHistoryChart', {
         extend: 'Ext.panel.Panel',
 
-        layout: 'fit',
+        // Not 'fit'. The Summary's column container hands every card the same
+        // minHeight, and a fit layout passes all of it to the chart -- so the
+        // legend docked beneath the plot comes out of the plot, leaving these
+        // graphs shorter than the stock ones beside them, and shorter again
+        // every time the legend wraps to another row. Anchoring instead lets
+        // the card shrink-wrap: the chart keeps a fixed height whatever the
+        // legend does, and extra legend rows make the card taller.
+        layout: 'anchor',
         border: false,
         header: false,
+        cls: 'pve-diskio-card',
+
+        // Height of the plot itself, header and legend excluded. PVE's Summary
+        // graphs are minHeight-360 cards whose 10 of padding and 34px header
+        // leave a 316px plot, so matching 316 puts these graphs exactly in step
+        // with the ones they sit beneath. Match the plot and not the card,
+        // because our own header is not a fixed height: it is 32 on the charts
+        // carrying a picker and 24 on the ones without, which sizing by card
+        // would quietly turn into two different plot heights.
+        plotHeight: 316,
 
         // Key of the entry being plotted, or 'all'.
         selected: 'all',
@@ -2213,6 +2243,17 @@ Ext.onReady(function () {
             let me = this;
 
             me.removeAll(true);
+            // removeAll() does not touch docked items, and the legend is docked
+            // on the card now -- so without this every rebuild (a new pick in
+            // the combobox, a new timeframe) would leave the old legend behind
+            // and stack another one under it.
+            if (me.legendCmp) {
+                if (!me.legendCmp.isDestroyed) {
+                    me.removeDocked(me.legendCmp, true);
+                }
+                me.legendCmp = undefined;
+            }
+            me.chartCmp = undefined;
             if (me.rrdstore) {
                 me.rrdstore.stopUpdate();
                 me.rrdstore.destroy();
@@ -2253,6 +2294,7 @@ Ext.onReady(function () {
                 unit: 'bytespersecond',
                 seriesConfig: spec.seriesConfig,
                 border: false,
+                anchor: '100%',
             });
 
             // Put the picker in the chart's own header, beside the title and
@@ -2275,12 +2317,59 @@ Ext.onReady(function () {
                 if (legend) {
                     header.remove(legend, false);
                     legend.dock = 'bottom';
-                    chart.addDocked(legend);
+                    // Docked on the card rather than on the chart: docking it
+                    // on the chart would take its rows out of the fixed chart
+                    // height again. Here the card simply grows, so the plot is
+                    // the same size however many rows the legend needs.
+                    me.addDocked(legend);
+                    me.legendCmp = legend;
                 }
             }
 
+            // The header's height is only known once it has rendered, and it
+            // changes with what is in it, so the chart is sized from the header
+            // rather than guessed at. Setting the chart's height never changes
+            // its header's, so this settles in one pass.
+            me.chartCmp = chart;
+            chart.on('afterrender', me.scheduleSyncPlotHeight, me);
+            chart.on('resize', me.scheduleSyncPlotHeight, me);
+
             me.add(chart);
             me.rrdstore.startUpdate();
+        },
+
+        // Ext discards a height set from inside its own layout run, so the
+        // correction is deferred out of it. One pass settles it: changing the
+        // chart's height does not change its header's.
+        scheduleSyncPlotHeight: function () {
+            let me = this;
+
+            if (me.syncPending || me.isDestroyed) {
+                return;
+            }
+            me.syncPending = true;
+            Ext.defer(function () {
+                me.syncPending = false;
+                me.syncPlotHeight();
+            }, 1);
+        },
+
+        // Keep the plot the same size as the stock Summary graphs, whatever
+        // the header holds and however many rows the legend has wrapped to.
+        syncPlotHeight: function () {
+            let me = this;
+            let chart = me.chartCmp;
+
+            if (!chart || chart.isDestroyed || !chart.rendered) {
+                return;
+            }
+
+            let header = chart.getHeader();
+            let want = me.plotHeight + (header && header.rendered ? header.getHeight() : 0);
+
+            if (chart.getHeight() !== want) {
+                chart.setHeight(want);
+            }
         },
 
         buildPicker: function () {
