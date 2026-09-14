@@ -17,6 +17,7 @@ set -euo pipefail
 
 DISKS_PM="/usr/share/perl5/PVE/API2/Disks.pm"
 INDEX_TPL="/usr/share/pve-manager/index.html.tpl"
+PANEL_JS="/usr/share/pve-manager/js/pve-disk-io.js"
 BACKUP_DIR="/var/backups/pve-disk-io"
 
 usage() {
@@ -61,6 +62,29 @@ do_patch() {
     ' "$INDEX_TPL"
 
     grep -q 'pve-disk-io\.js' "$INDEX_TPL" || { echo "failed to add the script tag" >&2; exit 1; }
+
+    # Cache-bust on the panel's own content. The obvious thing is to copy what
+    # the stock tags do and write "?ver=[% version %]", but that is the
+    # pve-manager version: it does not change when only this package is
+    # redeployed, so browsers keep serving the panel they already have and
+    # every fix looks like it did nothing. An md5 of the file changes exactly
+    # when the file does, and re-stamping on every patch is what makes a
+    # redeploy between pve-manager upgrades actually reach the browser.
+    #
+    # The braces in ${1}/${2} are load-bearing: an md5 beginning with a digit
+    # would otherwise read as one long capture-group number ($1 followed by
+    # 00957... is group $100957, not group 1), which silently ate half the
+    # script tag and left the panel unable to load at all.
+    if [ -f "$PANEL_JS" ]; then
+        stamp="$(md5sum "$PANEL_JS" | cut -d' ' -f1)"
+        perl -0777 -i -pe \
+            "s{(src=\"/pve2/js/pve-disk-io\\.js\\?ver=)[^\"]*(\")}{\${1}${stamp}\${2}}" \
+            "$INDEX_TPL"
+        grep -q "pve-disk-io\.js?ver=$stamp" "$INDEX_TPL" || {
+            echo "failed to stamp the script tag" >&2
+            exit 1
+        }
+    fi
 
     # Never restart the API into code that does not compile.
     perl -I/usr/share/perl5 -c /usr/share/perl5/PVE/DiskIO.pm
