@@ -35,7 +35,16 @@ cd "$H" && python3 -m http.server 8899 --bind 127.0.0.1
 
 `index.html` mirrors `/usr/share/pve-manager/index.html.tpl`: the same script
 order, the `Proxmox` setup object, the `gettext` shims, and the
-`#x-history-field` form. It also records load-time exceptions:
+`#x-history-field` form. Shim **both** translation functions -- `proxmoxlib.js`
+calls `ngettext` while building `Proxmox.Utils`, and without it that whole
+object is left undefined, which surfaces much later as an unrelated-looking
+`Cannot read properties of undefined (reading 'defaultText')` from
+`pvemanagerlib.js`:
+
+```js
+function gettext(buf) { return buf; }
+function ngettext(s, p, n) { return n === 1 ? s : p; }
+``` It also records load-time exceptions:
 
 ```js
 window.__errors = [];
@@ -91,6 +100,31 @@ io.stopPolling();
 io.previous = null;
 for (let i = 0; i < 8; i++) { io.poll(); }   // synchronous stub, no timers
 ```
+
+The Summary graphs load through `Proxmox.RestProxy`, i.e. the real Ajax stack,
+which is awkward to fake faithfully. Loading the recorded rows straight into the
+chart's store gives it the same records it would get from the node:
+
+```js
+let chart = card.down('proxmoxRRDChart');
+chart.getStore().stopUpdate();
+chart.getStore().loadRawData(window.__samples.rrddata);
+chart.redraw();
+```
+
+Geometry is worth asserting rather than eyeballing -- compare against a stock
+graph in the same container, which is the thing these have to line up with:
+
+```js
+let c = summary.down('#itemcontainer');
+c.down('proxmoxRRDChart').body.getHeight();            // stock plot height
+c.down('pveNodeDiskIOSummaryChart').down('proxmoxRRDChart').body.getHeight();
+```
+
+Drive the viewport width across the column-layout breakpoint too
+(`Proxmox.Utils.updateColumnWidth` switches between one and two columns), and
+check the legend is not clipping: `el.scrollWidth > el.clientWidth` on the
+legend element means entries have run off the right-hand edge.
 
 Keep the replay stub synchronous. A hidden browser tab throttles `setTimeout`,
 so an async replay that awaits between polls will stall.
