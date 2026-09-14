@@ -106,6 +106,31 @@ it does not kill the job. Every action is written to the syslog with the user
 who asked for it, and the write actions need `Sys.Modify` rather than the
 `Sys.Audit` the rest of the panel uses.
 
+#### Excluding a drive from SMART polling
+
+Every `smartctl` call against a drive with uncorrectable sectors blocks for
+seconds while the drive retries them. With the attribute sweep and the
+temperature sweep both running on timers, one failing disk is enough to keep
+them stacked on top of each other, burning CPU and — where the drives share a
+bus — starving everything else on it.
+
+List such a drive in `/etc/smart-exclude`, one per line, and both sweeps skip
+it. Blank lines and `#` comments are ignored, and the match is on the basename,
+so `sdh`, `/dev/sdh` and a `/dev/disk/by-id/...` path all work:
+
+```
+# one failing drive, excluded while it is being repaired
+/dev/disk/by-id/ata-ST8000DM004-2CX188_WCT07PJ7
+```
+
+The file is re-read whenever its mtime changes, so there is nothing to restart.
+
+**Name the drive by `by-id`, not `sdX`.** Kernel node letters are assigned in
+discovery order and move between reboots — especially with USB enclosures. An
+exclusion written as `sdh` stops excluding the drive you meant the moment the
+letters shift, and starts excluding a healthy one instead, which shows up as a
+disk that has quietly stopped reporting SMART rather than as an error.
+
 ### Node → Summary → Disk I/O
 
 Recorded per-disk history, beside the CPU, memory and network graphs, driven by
@@ -199,6 +224,7 @@ Month and Year accumulate from install.
 | new | `/lib/systemd/system/pve-disk-io-collector.{service,timer}` |
 | edit | `/usr/share/perl5/PVE/API2/Disks.pm` — registers the API subclass |
 | edit | `/usr/share/pve-manager/index.html.tpl` — loads the panel |
+| read | `/etc/smart-exclude` — optional, drives to skip when polling SMART |
 
 Pristine copies of the two edited files are kept in
 `/var/backups/pve-disk-io/`.

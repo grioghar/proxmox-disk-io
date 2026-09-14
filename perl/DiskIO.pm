@@ -304,6 +304,33 @@ sub _smart_one {
     return $row;
 }
 
+# Devices listed in /etc/smart-exclude are never probed. A drive with
+# uncorrectable sectors makes every smartctl call block for seconds, so a drive
+# under repair must be skipped by both the attribute and temperature sweeps
+# rather than slowing the whole refresh down.
+my $SMART_EXCLUDE_FILE = '/etc/smart-exclude';
+my ($_excl_mtime, %_excl) = (0);
+sub _smart_excluded {
+    my ($dev) = @_;
+    return 0 if !defined($dev);
+    my $mtime = (stat($SMART_EXCLUDE_FILE))[9] // 0;
+    if ($mtime != $_excl_mtime) {
+        %_excl = ();
+        $_excl_mtime = $mtime;
+        if (open(my $fh, '<', $SMART_EXCLUDE_FILE)) {
+            while (my $line = <$fh>) {
+                $line =~ s/#.*//; $line =~ s/^\s+|\s+$//g;
+                next if $line eq '';
+                $line =~ s{^.*/}{};
+                $_excl{$line} = 1;
+            }
+            close($fh);
+        }
+    }
+    (my $base = $dev) =~ s{^.*/}{};
+    return $_excl{$base} ? 1 : 0;
+}
+
 sub smart_refresh {
     # One refresher at a time: a stampede would spin every drive up at once.
     open(my $lock, '>', SMART_LOCK) or return 0;
@@ -313,6 +340,7 @@ sub smart_refresh {
     my $out = { updated => time(), disks => {} };
     for my $devno (sort keys %$physical) {
         my $disk = $physical->{$devno};
+        next if _smart_excluded($disk->{dev});
         my $row = _smart_one($disk->{dev}, $disk->{kind});
         $out->{disks}->{ $disk->{dev} } = $row if $row;
     }
@@ -340,6 +368,7 @@ sub temp_refresh {
     my $out = { updated => time(), disks => {} };
     for my $devno (sort keys %$physical) {
         my $dev = $physical->{$devno}->{dev};
+        next if _smart_excluded($dev);
         my $temp;
 
         # NVMe publishes temperature through hwmon, which is a plain sysfs read
