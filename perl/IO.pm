@@ -723,6 +723,26 @@ sub _fetch_rrd {
     return _fetch_rrd_file(PVE::DiskIO::rrd_file($node, $key), $timeframe, $cf);
 }
 
+sub _row_has_data {
+    my ($row) = @_;
+    for my $key (keys %$row) {
+        next if $key eq 'time';
+        return 1 if defined $row->{$key};
+    }
+    return 0;
+}
+
+# A window that runs to "now" always ends in a slot or two RRD has not
+# consolidated yet, which come back as unknown. Emitted, they make every series
+# dive to the floor at the right hand edge and the graph reads as though all
+# I/O just stopped. PVE's own rrddata ends on real data, so match it and drop
+# them. Only trailing rows: a gap in the middle is a real gap and must stay one.
+sub _trim_trailing_gaps {
+    my ($rows) = @_;
+    pop @$rows while scalar(@$rows) && !_row_has_data($rows->[-1]);
+    return $rows;
+}
+
 sub _fetch_rrd_file {
     my ($file, $timeframe, $cf) = @_;
 
@@ -1118,7 +1138,9 @@ __PACKAGE__->register_method({
             }
         }
 
-        return [map { $rows->{$_} } sort { $a <=> $b } keys %$rows];
+        return _trim_trailing_gaps(
+            [map { $rows->{$_} } sort { $a <=> $b } keys %$rows],
+        );
     },
 });
 
@@ -1283,7 +1305,9 @@ __PACKAGE__->register_method({
             }
         }
 
-        return [map { $rows->{$_} } sort { $a <=> $b } keys %$rows];
+        return _trim_trailing_gaps(
+            [map { $rows->{$_} } sort { $a <=> $b } keys %$rows],
+        );
     },
 });
 
@@ -1415,10 +1439,17 @@ __PACKAGE__->register_method({
                 if ($which eq 'all') {
                     # One field per disk, named by its current kernel name so
                     # the chart legend reads the way the disk grid does.
-                    my $total = 0;
-                    $total += $point->{rdbytes} if defined($point->{rdbytes});
-                    $total += $point->{wrbytes} if defined($point->{wrbytes});
-                    $row->{ $entry->{dev} // $entry->{key} } = $total;
+                    #
+                    # Left undefined when the slot holds no sample at all: a
+                    # gap is not a measured zero, and summing one into 0 is
+                    # what drew the cliff at the right hand edge of the graph.
+                    my $total;
+                    $total = ($total // 0) + $point->{rdbytes}
+                        if defined($point->{rdbytes});
+                    $total = ($total // 0) + $point->{wrbytes}
+                        if defined($point->{wrbytes});
+                    $row->{ $entry->{dev} // $entry->{key} } = $total
+                        if defined($total);
                 } else {
                     $row->{read} = $point->{rdbytes};
                     $row->{write} = $point->{wrbytes};
@@ -1433,14 +1464,20 @@ __PACKAGE__->register_method({
 
                     # Average service time: both sides are rates over the same
                     # interval, so the ratio is milliseconds per operation.
+                    # A slot with no sample leaves this undefined rather
+                    # than 0: no operations and no data are different answers,
+                    # and only one of them belongs on the graph as a value.
+                    my $sampled = defined($point->{rdios}) || defined($point->{wrios});
                     my $ios = ($point->{rdios} // 0) + ($point->{wrios} // 0);
                     my $ticks = ($point->{rdtime} // 0) + ($point->{wrtime} // 0);
-                    $row->{latency} = $ios > 0 ? $ticks / $ios : 0;
+                    $row->{latency} = !$sampled ? undef : ($ios > 0 ? $ticks / $ios : 0);
                 }
             }
         }
 
-        return [map { $rows->{$_} } sort { $a <=> $b } keys %$rows];
+        return _trim_trailing_gaps(
+            [map { $rows->{$_} } sort { $a <=> $b } keys %$rows],
+        );
     },
 });
 
