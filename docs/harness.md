@@ -126,6 +126,25 @@ Drive the viewport width across the column-layout breakpoint too
 check the legend is not clipping: `el.scrollWidth > el.clientWidth` on the
 legend element means entries have run off the right-hand edge.
 
+The per-guest live page is driven the same way, through `PVE.lxc.Config`
+(or `PVE.qemu.Config`) instead of `PVE.node.Config`. Both **throw
+`no workspace specified`** before they build anything, so stub one — it needs
+nothing real:
+
+```js
+let cfg = Ext.create('PVE.lxc.Config', {
+  pveSelNode: { data: { node: 'proxmox', vmid: '3134', type: 'lxc',
+                        id: 'lxc/3134', text: 'qbittorrent' } },
+  showSearch: false,
+  workspace: { onlineHelp: () => {}, setUrl: () => {}, updateUserInfo: () => {} },
+});
+cfg.activateCard('disk-io');
+```
+
+The card title will read `Container 3134 (undefined)`, which is PVE composing it
+from a field the real tree supplies and the stub omits — not a fault in
+anything under test.
+
 Keep the replay stub synchronous. A hidden browser tab throttles `setTimeout`,
 so an async replay that awaits between polls will stall.
 
